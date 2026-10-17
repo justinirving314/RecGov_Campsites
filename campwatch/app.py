@@ -19,10 +19,11 @@ from sqlalchemy.orm import Session
 
 from . import __version__
 from .auth import COOKIE_NAME, SESSION_DAYS, make_token, password_ok, require_login, token_valid
+from .availability import nights_between
 from .booker import CartHolder
 from .checker import Checker
 from .config import Settings
-from .models import Opening, Watch, make_session_factory
+from .models import Opening, Watch, make_session_factory, utcnow
 from .notify import Notification, Notifier
 from .providers import Provider, ProviderError
 from .providers.recgov import RecGovClient
@@ -31,6 +32,7 @@ from .schemas import (
     CampgroundOut,
     CampgroundSearchOut,
     LoginIn,
+    NightsPatch,
     OpeningOut,
     SiteOut,
     WatchIn,
@@ -89,6 +91,7 @@ def create_app(
     app = FastAPI(title="CampWatch", version=__version__, lifespan=lifespan)
     app.state.settings = settings
     app.state.sessions = make_session_factory(settings.db_url)
+    app.state.today = today
 
     app.include_router(public)
     app.include_router(api, dependencies=[Depends(require_login)])
@@ -172,10 +175,12 @@ def _apply(watch: Watch, body: WatchIn) -> None:
     watch.targets = [t.model_dump() for t in body.targets]
     watch.date_ranges = [r.model_dump(mode="json") for r in body.date_ranges]
     watch.min_nights = body.min_nights
+    watch.piecemeal = body.piecemeal
     watch.action = body.action
     watch.active = body.active
     if body.active:
         watch.status_note = None
+    watch.prune_nights()  # keep progress for nights still in the dates
 
 
 @api.get("/watches")
@@ -199,14 +204,34 @@ def get_watch(watch_id: int, db: DB) -> WatchOut:
 
 
 @api.put("/watches/{watch_id}")
-def update_watch(watch_id: int, body: WatchIn, db: DB) -> WatchOut:
+def update_watch(watch_id: int, body: WatchIn, request: Request, db: DB) -> WatchOut:
     watch = _get_watch(db, watch_id)
-    criteria = (watch.targets, watch.date_ranges, watch.min_nights)
+    criteria = (watch.targets, watch.date_ranges, watch.min_nights, watch.piecemeal)
     _apply(watch, body)
-    if criteria != (watch.targets, watch.date_ranges, watch.min_nights):
-        # Openings found under the old criteria may not match the new ones; start fresh.
-        watch.openings = [o for o in watch.openings if o.gone_at is not None]
+    if criteria != (watch.targets, watch.date_ranges, watch.min_nights, watch.piecemeal):
+        # Openings found under the old criteria may not match the new ones. Close them
+        # (keeping the history) so the next check starts fresh and can alert again.
+        now = utcnow()
+        for opening in watch.openings:
+            if opening.gone_at is None:
+                opening.gone_at = now
         watch.last_error = None
+    watch.update_completion(request.app.state.today())  # new dates restart a finished watch
+    db.commit()
+    return _watch_out(watch)
+
+
+@api.patch("/watches/{watch_id}/nights")
+def set_nights(watch_id: int, body: NightsPatch, request: Request, db: DB) -> WatchOut:
+    """Mark nights booked, held or skipped (or needed again) on a night-by-night watch."""
+    watch = _get_watch(db, watch_id)
+    if not watch.piecemeal:
+        raise HTTPException(422, "Only night-by-night watches track individual nights")
+    outside = set(body.nights) - set(watch.all_nights())
+    if outside:
+        raise HTTPException(422, f"{min(outside)} isn't one of this watch's nights")
+    watch.mark_nights(body.nights, None if body.status == "needed" else body.status)
+    watch.update_completion(request.app.state.today())
     db.commit()
     return _watch_out(watch)
 
@@ -234,6 +259,35 @@ async def check_now(watch_id: int, request: Request) -> WatchOut:
     await request.app.state.checker.check(watch_id)
     with request.app.state.sessions() as db:
         return _watch_out(_get_watch(db, watch_id))
+
+
+@api.post("/openings/{opening_id}/booked")
+def mark_booked(opening_id: int, request: Request, db: DB) -> WatchOut:
+    """You booked this opening. Night by night: those nights are done, keep looking for the
+    rest. Other watches: the watch has done its job, so it pauses."""
+    opening = db.get(Opening, opening_id)
+    if opening is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Opening not found")
+    watch = opening.watch
+    opening.cart_status = "booked"
+    nights = nights_between(opening.check_in, opening.check_out)
+    if watch.piecemeal:
+        in_plan = set(watch.all_nights())
+        watch.mark_nights(
+            [n for n in nights if n in in_plan],
+            "booked",
+            site=opening.site,
+            campground_name=opening.campground_name,
+            campsite_id=opening.campsite_id,
+            provider=opening.provider,
+            opening_id=opening.id,
+        )
+        watch.update_completion(request.app.state.today())
+    else:
+        watch.active = False
+        watch.status_note = f"Booked site {opening.site}, {opening.campground_name}."
+    db.commit()
+    return _watch_out(watch)
 
 
 @api.get("/openings")

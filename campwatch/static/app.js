@@ -112,7 +112,71 @@ function inSeconds(iso) {
 }
 
 function stayLabel(w) {
+  if (w.piecemeal) return 'Night by night';
   return w.min_nights ? `Any ${w.min_nights}+ nights in a row` : 'Whole stay at one site';
+}
+
+// ---------- Night-by-night progress ----------
+
+const NIGHT_LABELS = { needed: 'Looking', booked: 'Booked', held: 'In cart', skipped: 'Skipped', past: 'Passed' };
+const NIGHT_ACTIONS = {
+  needed: [['booked', 'I booked it'], ['skipped', 'Skip this night']],
+  held: [['booked', 'I booked it'], ['needed', 'Didn’t book, keep looking']],
+  booked: [['needed', 'Cancelled, look again'], ['skipped', 'Don’t need it']],
+  skipped: [['needed', 'Look for it again']],
+};
+const weekdayFmt = new Intl.DateTimeFormat(undefined, { weekday: 'short' });
+const monthDayFmt = new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric' });
+
+function nightProgress(w) {
+  const today = isoDay(new Date());
+  const future = w.night_plan.filter((p) => p.night >= today);
+  return { today, future, looking: future.filter((p) => p.status === 'needed') };
+}
+
+function nightStrip(w, onUpdate) {
+  const { today, future, looking } = nightProgress(w);
+  const menu = h('div', { class: 'night-menu', hidden: true });
+  let shown = null;
+
+  const showMenu = (p, status) => {
+    if (shown === p.night) { menu.hidden = true; shown = null; return; }
+    shown = p.night;
+    const where = p.site ? `Site ${p.site}${p.campground_name ? `, ${p.campground_name}` : ''}` : '';
+    menu.replaceChildren(
+      h('div', { class: 'small' }, h('strong', {}, dayFmt.format(parseDay(p.night))), where && ` · ${where}`),
+      h('div', { class: 'actions' }, (NIGHT_ACTIONS[status] || []).map(([to, label]) => {
+        const button = h('button', { class: 'btn small', type: 'button' }, label);
+        button.addEventListener('click', () => withBusy(button, async () => {
+          onUpdate(await api(`/watches/${w.id}/nights`, { method: 'PATCH', body: { nights: [p.night], status: to } }));
+        }).catch(showError));
+        return button;
+      })));
+    menu.hidden = false;
+  };
+
+  const chips = w.night_plan.map((p) => {
+    const status = p.status === 'needed' && p.night < today ? 'past' : p.status;
+    const day = parseDay(p.night);
+    return h('button', {
+      class: `night ${status}`,
+      type: 'button',
+      disabled: status === 'past',
+      'aria-label': `${dayFmt.format(day)}: ${NIGHT_LABELS[status]}`,
+      onclick: () => showMenu(p, status),
+    },
+    h('span', { class: 'night-day' }, weekdayFmt.format(day)),
+    h('span', { class: 'night-date' }, monthDayFmt.format(day)),
+    h('span', { class: 'night-status' }, NIGHT_LABELS[status] || status));
+  });
+
+  const summary = looking.length
+    ? `Still looking for ${looking.length} of ${future.length} night${future.length === 1 ? '' : 's'}. Tap a night to update it.`
+    : 'Every night is covered. Tap a night to change it.';
+  return h('div', { class: 'night-plan' },
+    h('p', { class: 'small muted' }, summary),
+    h('div', { class: 'night-strip' }, chips),
+    menu);
 }
 
 const PROVIDERS = { recgov: 'Recreation.gov', reservecalifornia: 'CA State Parks' };
@@ -213,10 +277,13 @@ async function renderWatches() {
 }
 
 function watchCard(w) {
+  const update = (updated) => card.replaceWith(watchCard(updated));
+  const done = w.piecemeal && w.night_plan.length > 0 && nightProgress(w).looking.length === 0;
   const expired = !w.active && w.status_note;
   const pill = w.active
     ? h('span', { class: 'pill ok' }, 'Watching')
-    : h('span', { class: 'pill' }, expired ? 'Stopped' : 'Paused');
+    : done ? h('span', { class: 'pill ok' }, 'Done')
+      : h('span', { class: 'pill' }, expired ? 'Stopped' : 'Paused');
 
   const checkBtn = h('button', { class: 'btn small', type: 'button' }, 'Check now');
   checkBtn.addEventListener('click', () => withBusy(checkBtn, async () => {
@@ -236,33 +303,49 @@ function watchCard(w) {
     h('p', { class: 'meta' }, w.targets.map(campgroundLabel).join(' · ')),
     h('p', { class: 'meta' }, w.date_ranges.map(rangeLabel).join(' · ')),
     h('p', { class: 'meta small' }, `${stayLabel(w)} · ${w.action === 'cart' ? 'Alert + hold in cart' : 'Alert only'}`),
-    w.status_note && h('p', { class: 'note' }, w.status_note),
+    w.piecemeal && nightStrip(w, update),
+    w.status_note && !done && h('p', { class: 'note' }, w.status_note),
     w.last_error && h('p', { class: 'error-text' }, `Last check had problems: ${w.last_error}`),
     w.openings.length > 0 && h('div', { class: 'openings' },
       h('h3', {}, `${w.openings.length} open now`),
-      w.openings.slice(0, 8).map(openingRow),
+      w.openings.slice(0, 8).map((o) => openingRow(o, update, w)),
       w.openings.length > 8 && h('p', { class: 'small muted' }, `and ${w.openings.length - 8} more`)),
     h('div', { class: 'card-foot' },
       h('span', { class: 'small muted' }, w.last_checked_at ? `Checked ${ago(w.last_checked_at)}` : 'Not checked yet'),
-      h('div', { class: 'actions' }, checkBtn, toggleBtn, h('a', { class: 'btn small', href: `#/edit/${w.id}` }, 'Edit'))));
+      h('div', { class: 'actions' }, checkBtn, !done && toggleBtn, h('a', { class: 'btn small', href: `#/edit/${w.id}` }, 'Edit'))));
   return card;
 }
 
-function openingRow(o) {
+function openingRow(o, onUpdate, w) {
+  const booked = o.cart_status === 'booked';
+  let bookedBtn = null;
+  if (!booked) {
+    bookedBtn = h('button', { class: 'btn small', type: 'button' }, 'I booked it');
+    bookedBtn.addEventListener('click', () => withBusy(bookedBtn, async () => {
+      const updated = await api(`/openings/${o.id}/booked`, { method: 'POST' });
+      onUpdate(updated);
+      if (!w.piecemeal) toast('Got it. This watch is paused.');
+      else if (nightProgress(updated).looking.length) toast('Got it. Still looking for the other nights.');
+      else toast('Got it. That covers every night.');
+    }).catch(showError));
+  }
   return h('div', { class: 'opening' },
     h('div', {},
       h('strong', {}, `Site ${o.site}`),
       o.loop && h('span', { class: 'muted small' }, ` · ${o.loop}`),
       h('div', { class: 'small' }, `${o.campground_name} · ${rangeLabel(o)}`),
       o.cart_status === 'held' && h('div', { class: 'small' }, '🛒 Held in your cart'),
+      booked && h('div', { class: 'small' }, '✓ You booked this'),
       o.cart_status === 'failed' && h('div', { class: 'small error-text' }, `Cart hold failed: ${o.cart_message || ''}`)),
-    h('a', { class: 'btn primary small', href: o.book_url, target: '_blank', rel: 'noopener' }, 'Book'));
+    h('div', { class: 'opening-actions' },
+      h('a', { class: 'btn primary small', href: o.book_url, target: '_blank', rel: 'noopener' }, 'Book'),
+      bookedBtn));
 }
 
 // ---------- Editor ----------
 
 function emptyDraft() {
-  return { name: '', targets: [], date_ranges: [{ check_in: '', check_out: '' }], min_nights: null, action: 'alert', active: true };
+  return { name: '', targets: [], date_ranges: [{ check_in: '', check_out: '' }], min_nights: null, piecemeal: false, action: 'alert', active: true };
 }
 
 async function renderEditor(id) {
@@ -406,8 +489,9 @@ async function renderEditor(id) {
 
   // Stay length
   const minNights = h('input', { type: 'number', min: 1, max: 30, value: draft.min_nights || 2, inputmode: 'numeric', 'aria-label': 'Minimum nights' });
-  const wholeStay = h('input', { type: 'radio', name: 'stay', value: 'whole', checked: !draft.min_nights });
-  const flexStay = h('input', { type: 'radio', name: 'stay', value: 'flex', checked: !!draft.min_nights });
+  const wholeStay = h('input', { type: 'radio', name: 'stay', value: 'whole', checked: !draft.min_nights && !draft.piecemeal });
+  const flexStay = h('input', { type: 'radio', name: 'stay', value: 'flex', checked: !!draft.min_nights && !draft.piecemeal });
+  const pieceStay = h('input', { type: 'radio', name: 'stay', value: 'piece', checked: !!draft.piecemeal });
   minNights.addEventListener('focus', () => { flexStay.checked = true; });
 
   // Action
@@ -449,6 +533,7 @@ async function renderEditor(id) {
         })),
         date_ranges: ranges.map(({ check_in, check_out }) => ({ check_in, check_out })),
         min_nights: flexStay.checked ? Number(minNights.value) || 1 : null,
+        piecemeal: pieceStay.checked,
         action: holdCart.checked ? 'cart' : 'alert',
         active: id ? draft.active : true,
       };
@@ -479,7 +564,12 @@ async function renderEditor(id) {
     h('label', { class: 'choice' }, flexStay,
       h('span', {},
         h('span', { class: 'inline' }, 'At least', minNights, 'nights in a row'),
-        h('span', { class: 'hint', style: 'display:block' }, 'Anywhere within the dates above, at one site')))),
+        h('span', { class: 'hint', style: 'display:block' }, 'Anywhere within the dates above, at one site'))),
+    h('label', { class: 'choice' }, pieceStay,
+      h('span', {},
+        'Night by night: grab any open nights',
+        h('span', { class: 'hint', style: 'display:block' },
+          'Takes nights as they open up, even one at a time, and keeps looking for the rest until every night is booked or skipped. Sites can differ from night to night; it prefers extending a site you already have.')))),
   h('fieldset', {},
     h('legend', {}, 'When a site opens up'),
     h('label', { class: 'choice' }, alertOnly, h('span', {}, 'Alert me')),
@@ -488,7 +578,7 @@ async function renderEditor(id) {
         'Alert me and hold the site in my Recreation.gov cart',
         h('span', { class: 'hint', style: 'display:block' },
           cart.available
-            ? 'Experimental, Recreation.gov sites only (CA State Parks sites still alert). You’ll have about 15 minutes to sign in and pay. The watch pauses after a successful hold.'
+            ? 'Experimental, Recreation.gov sites only (CA State Parks sites still alert). You’ll have about 15 minutes to sign in and pay. Other watches pause after a hold; night-by-night watches keep looking for the remaining nights.'
             : `Not set up yet. ${cart.reason || ''}`)))),
   h('fieldset', {},
     h('legend', {}, 'Name'),
@@ -661,7 +751,8 @@ async function renderActivity() {
     }
     view.replaceChildren(h('div', { class: 'stack' }, openings.map((o) => {
       const open = !o.gone_at;
-      const pill = o.cart_status === 'held' ? h('span', { class: 'pill ok' }, 'In cart')
+      const pill = o.cart_status === 'booked' ? h('span', { class: 'pill ok' }, 'Booked')
+        : o.cart_status === 'held' ? h('span', { class: 'pill ok' }, 'In cart')
         : open ? h('span', { class: 'pill ok' }, 'Open')
           : h('span', { class: 'pill' }, 'Gone');
       return h('article', { class: `card list-item${open ? '' : ' gone'}` },

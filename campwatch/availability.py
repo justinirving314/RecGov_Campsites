@@ -114,6 +114,7 @@ def find_stays(
     check_out: date,
     min_nights: int | None = None,
     sites: Iterable[str] = (),
+    needed: set[date] | None = None,
 ) -> list[Stay]:
     """Open stays inside [check_in, check_out).
 
@@ -122,11 +123,12 @@ def find_stays(
     ``sites`` limits the search to those sites and ranges (see ``site_matcher``); empty
     means any site.
     A run shorter than the site's minimum stay for its first night is skipped.
+    ``needed``, if given, is the set of nights still wanted; other nights break a run.
     """
     window = nights_between(check_in, check_out)
     if not window:
         return []
-    needed = len(window) if min_nights is None else min(min_nights, len(window))
+    shortest = len(window) if min_nights is None else min(min_nights, len(window))
     wanted = site_matcher(sites)
 
     stays = []
@@ -137,10 +139,14 @@ def find_stays(
             continue
         run: list[date] = []
         for night in [*window, None]:
-            if night is not None and site.availability.get(night) == AVAILABLE:
+            if (
+                night is not None
+                and site.availability.get(night) == AVAILABLE
+                and (needed is None or night in needed)
+            ):
                 run.append(night)
                 continue
-            if run and len(run) >= max(needed, site.min_stay.get(run[0], 1)):
+            if run and len(run) >= max(shortest, site.min_stay.get(run[0], 1)):
                 stays.append(
                     Stay(
                         campsite_id=site.campsite_id,

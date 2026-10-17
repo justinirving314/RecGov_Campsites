@@ -6,7 +6,7 @@ import pytest
 
 from campwatch.booker import HoldResult
 from campwatch.checker import Checker
-from campwatch.models import Opening, Watch, make_session_factory
+from campwatch.models import DONE_NOTE, Opening, Watch, make_session_factory
 from campwatch.providers import Campsite, ProviderError, RateLimitedError
 
 TODAY = date(2027, 6, 1)
@@ -347,3 +347,120 @@ def test_old_watches_without_provider_default_to_recreation_gov(env):
     recgov.set_open(CAMPGROUND, JULY, {"5012": [d(10), d(11)]})
     run(checker.check(None))
     assert len(notifier.sent) == 1
+
+
+# --- Night by night ---------------------------------------------------------------------
+
+
+def piece_watch(sessions, **kw) -> int:
+    return add_watch(
+        sessions,
+        piecemeal=True,
+        date_ranges=[{"check_in": "2027-07-10", "check_out": "2027-07-14"}],  # 4 nights
+        **kw,
+    )
+
+
+def mark(sessions, watch_id, nights, status, **info):
+    with sessions() as db:
+        watch = db.get(Watch, watch_id)
+        watch.mark_nights(nights, status, **info)
+        watch.update_completion(TODAY)
+        db.commit()
+
+
+def test_piecemeal_alerts_on_one_night_and_keeps_looking(env):
+    sessions, recgov, notifier, _, checker = env
+    watch_id = piece_watch(sessions)
+    recgov.set_open(CAMPGROUND, JULY, {"5012": [d(11)]})
+    run(checker.check(None))
+    assert len(notifier.sent) == 1
+    assert "I booked it" in notifier.sent[0].message
+
+    mark(sessions, watch_id, [d(11)], "booked", site="012", campsite_id="5012")
+    # Jul 11 is now yours; the same site also opens Jul 12. Only Jul 12 is news.
+    recgov.set_open(CAMPGROUND, JULY, {"5012": [d(11), d(12)]})
+    run(checker.check(None))
+    assert len(notifier.sent) == 2
+    current = [(o.check_in, o.check_out) for o in openings(sessions, watch_id) if not o.gone_at]
+    assert current == [(d(12), d(13))]
+    with sessions() as db:
+        assert db.get(Watch, watch_id).active
+
+
+def test_piecemeal_only_fetches_months_that_still_need_nights(env):
+    sessions, recgov, _, _, checker = env
+    watch_id = add_watch(
+        sessions,
+        piecemeal=True,
+        date_ranges=[{"check_in": "2027-07-30", "check_out": "2027-08-02"}],
+    )
+    mark(sessions, watch_id, [d(30), d(31)], "booked")
+    run(checker.check(None))
+    assert recgov.calls == [(CAMPGROUND, date(2027, 8, 1))]
+
+
+def test_piecemeal_finishes_when_every_night_is_covered_and_resumes(env):
+    sessions, recgov, _, _, checker = env
+    watch_id = piece_watch(sessions)
+    mark(sessions, watch_id, [d(10), d(11)], "booked")
+    mark(sessions, watch_id, [d(12)], "skipped")
+    mark(sessions, watch_id, [d(13)], "held")
+    with sessions() as db:
+        watch = db.get(Watch, watch_id)
+        assert not watch.active
+        assert watch.status_note == DONE_NOTE
+
+    mark(sessions, watch_id, [d(13)], None)  # the hold lapsed: need it again
+    with sessions() as db:
+        watch = db.get(Watch, watch_id)
+        assert watch.active
+        assert watch.needed_nights(TODAY) == {d(13)}
+    run(checker.check(None))
+    assert recgov.calls == [(CAMPGROUND, JULY)]
+
+
+def test_piecemeal_cart_holds_several_pieces_and_keeps_watching(env):
+    sessions, recgov, notifier, holder, checker = env
+    watch_id = piece_watch(sessions, action="cart")
+    recgov.set_open(CAMPGROUND, JULY, {"5012": [d(10)], "5013": [d(12), d(13)]})
+    run(checker.check(None))
+
+    assert holder.calls == [("5013", d(12), d(14)), ("5012", d(10), d(11))], "longest first"
+    with sessions() as db:
+        watch = db.get(Watch, watch_id)
+        assert watch.active, "still looking for Jul 11"
+        assert watch.needed_nights(TODAY) == {d(11)}
+        assert watch.nights[d(12).isoformat()]["site"] == "013"
+    held = [n for n in notifier.sent if n.title.startswith("In your cart")]
+    assert len(held) == 2
+    assert "Still looking for Sun Jul 11" in held[1].message
+
+
+def test_piecemeal_cart_trims_overlapping_openings(env):
+    sessions, recgov, _, holder, checker = env
+    piece_watch(sessions, action="cart")
+    recgov.set_open(CAMPGROUND, JULY, {"5012": [d(10), d(11)], "5013": [d(11), d(12)]})
+    run(checker.check(None))
+    assert holder.calls == [("5012", d(10), d(12)), ("5013", d(12), d(13))]
+
+
+def test_piecemeal_cart_prefers_extending_your_site(env):
+    sessions, recgov, _, holder, checker = env
+    watch_id = piece_watch(sessions, action="cart")
+    mark(sessions, watch_id, [d(10)], "booked", site="012", campsite_id="5012")
+    recgov.set_open(CAMPGROUND, JULY, {"5013": [d(11)], "5012": [d(11)]})
+    run(checker.check(None))
+    assert holder.calls[0] == ("5012", d(11), d(12))
+    assert len(holder.calls) == 1, "the other site's opening is no longer needed"
+
+
+def test_piecemeal_cart_failure_leaves_night_needed(env):
+    sessions, recgov, notifier, holder, checker = env
+    holder.ok = False
+    watch_id = piece_watch(sessions, action="cart")
+    recgov.set_open(CAMPGROUND, JULY, {"5012": [d(10)]})
+    run(checker.check(None))
+    assert notifier.sent[-1].title.startswith("Couldn't hold")
+    with sessions() as db:
+        assert d(10) in db.get(Watch, watch_id).needed_nights(TODAY)

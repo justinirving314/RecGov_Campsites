@@ -1,7 +1,7 @@
 import sqlite3
 from datetime import date
 
-from campwatch.models import Opening, make_session_factory
+from campwatch.models import Opening, Watch, make_session_factory
 
 
 def test_upgrades_a_database_from_the_first_release(tmp_path):
@@ -38,3 +38,7 @@ def test_upgrades_a_database_from_the_first_release(tmp_path):
         assert opening.provider == "recgov"
         assert opening.book_url == "https://www.recreation.gov/camping/campsites/5012"
         assert opening.check_in == date(2027, 7, 10)
+        watch = db.get(Watch, 1)
+        assert watch.piecemeal is False
+        assert watch.night_plan == []
+        assert watch.needed_nights(date(2027, 1, 1)) == set()

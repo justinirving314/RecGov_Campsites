@@ -4,7 +4,7 @@ Watch campgrounds on **Recreation.gov** (national parks and forests, Army Corps 
 
 - **Watches.** Each watch covers one or more campgrounds (optionally only certain sites) and one or more sets of dates. A single watch can mix Recreation.gov and California State Parks campgrounds. Add as many watches as you like.
 - **Any site or specific sites.** For each campground, choose **Any site** or **Specific sites**. Type sites and ranges such as `12, 15-22, A1-A10`, or tap sites on the campground's list. The app shows how many sites your entries cover and flags any that match nothing.
-- **Stay rules.** Ask for the whole stay at one site, or for any N nights in a row within a wider window, such as "any 2 nights in July".
+- **Stay rules.** Ask for the whole stay at one site, for any N nights in a row within a wider window (such as "any 2 nights in July"), or **night by night**: grab nights as they open, even one at a time, and keep looking for the rest.
 - **Alerts.** Push notifications through [ntfy](https://ntfy.sh) or [Pushover](https://pushover.net), or email. Each alert has a "Book" link that opens the site's page. You're alerted once per opening, not every minute.
 - **Hold in cart (optional, experimental, Recreation.gov only).** CampWatch signs in to your Recreation.gov account and adds the site to your cart. You then have about 15 minutes to pay. Payment is always left to you.
 - **Web app and iPhone app.** One mobile-first web app. On iPhone, add it to your home screen and it opens full screen like a native app.
@@ -79,6 +79,24 @@ Each campground in a watch is set to **Any site** (the default) or **Specific si
 | `B-7` | A site literally named `B-7`. Both ends of a range need numbers, so this isn't one |
 
 You can also tap sites in the list below the box to add or remove them; the box and the list stay in sync. Sites covered by a range can only be removed by editing the range. Switching to **Any site** and back restores what you typed.
+
+## Night by night
+
+For a trip where any open night is worth grabbing, choose **Night by night: grab any open nights** under the dates. CampWatch then tracks every night of the trip separately:
+
+| Night status | Meaning |
+| --- | --- |
+| Looking | Still needed; CampWatch alerts (and holds, if set to) when it opens |
+| In cart | CampWatch held it in your Recreation.gov cart; confirm once you've paid |
+| Booked | You have it |
+| Skipped | You don't need it any more |
+
+- When a site opens for some of the nights you still need, you get an alert. Book it, then tap **I booked it** on the opening. Those nights become Booked, and CampWatch keeps looking for the rest. It won't alert you again for nights you already have.
+- With **hold in cart**, CampWatch holds as many needed nights as it can in one check, up to three separate holds. It never holds a night twice. When it has a choice, it prefers extending a site you already have, so you're less likely to move between sites. Each held night shows **In cart** until you tap **I booked it** or **Didn't book, keep looking**.
+- Tap any night on the watch card to change it: mark it booked (say you booked it elsewhere), skip it, or put it back to Looking after a cancellation.
+- Edit the dates at any time. Progress is kept for nights still in the trip. When every night is booked or skipped, the watch shows **Done** and stops checking. Adding a night, or putting one back to Looking, starts it again.
+
+Different nights may end up at different sites. The site filter you set for each campground still applies.
 
 ## California State Parks
 

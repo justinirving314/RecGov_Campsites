@@ -167,6 +167,7 @@ def test_editing_criteria_resets_open_openings(client):
         json={**WATCH, "date_ranges": [{"check_in": "2027-07-20", "check_out": "2027-07-22"}]},
     ).json()
     assert changed["openings"] == []
+    assert len(client.get("/api/openings").json()) == 1, "kept in the activity history"
 
 
 def test_openings_feed(client):
@@ -307,3 +308,92 @@ def test_site_range_limits_what_alerts(client):
     watch = client.post("/api/watches", json={**WATCH, "targets": [included]}).json()
     [opening] = client.post(f"/api/watches/{watch['id']}/check").json()["openings"]
     assert opening["site"] == "10"
+
+
+PIECE = {
+    **WATCH,
+    "piecemeal": True,
+    "date_ranges": [{"check_in": "2027-07-10", "check_out": "2027-07-14"}],
+}
+
+
+def set_nights(client, watch_id, nights, status):
+    return client.patch(
+        f"/api/watches/{watch_id}/nights", json={"nights": nights, "status": status}
+    )
+
+
+def statuses(watch):
+    return {p["night"]: p["status"] for p in watch["night_plan"]}
+
+
+def test_night_plan_and_manual_updates(client):
+    watch = client.post("/api/watches", json=PIECE).json()
+    assert list(statuses(watch).values()) == ["needed"] * 4
+
+    watch = set_nights(client, watch["id"], ["2027-07-10", "2027-07-11"], "booked").json()
+    watch = set_nights(client, watch["id"], ["2027-07-12"], "skipped").json()
+    assert statuses(watch)["2027-07-12"] == "skipped"
+    assert watch["active"]
+
+    watch = set_nights(client, watch["id"], ["2027-07-13"], "booked").json()
+    assert not watch["active"], "every night covered"
+
+    watch = set_nights(client, watch["id"], ["2027-07-12"], "needed").json()
+    assert watch["active"], "a night needed again resumes the watch"
+
+
+def test_night_updates_are_validated(client):
+    piece = client.post("/api/watches", json=PIECE).json()
+    assert set_nights(client, piece["id"], ["2027-08-01"], "booked").status_code == 422
+    assert set_nights(client, piece["id"], ["2027-07-10"], "maybe").status_code == 422
+    whole = client.post("/api/watches", json=WATCH).json()
+    assert set_nights(client, whole["id"], ["2027-07-10"], "booked").status_code == 422
+
+
+def test_i_booked_it_on_a_night_by_night_watch(client):
+    # FakeInternet has site 10 open Jul 10 and 11.
+    watch = client.post("/api/watches", json=PIECE).json()
+    [opening] = client.post(f"/api/watches/{watch['id']}/check").json()["openings"]
+    assert (opening["check_in"], opening["check_out"]) == ("2027-07-10", "2027-07-12")
+
+    watch = client.post(f"/api/openings/{opening['id']}/booked").json()
+    plan = {p["night"]: p for p in watch["night_plan"]}
+    assert plan["2027-07-10"]["status"] == "booked"
+    assert plan["2027-07-10"]["site"] == "10"
+    assert plan["2027-07-12"]["status"] == "needed"
+    assert watch["active"]
+
+    rechecked = client.post(f"/api/watches/{watch['id']}/check").json()
+    assert rechecked["openings"] == [], "nights you booked aren't alerted again"
+
+
+def test_i_booked_it_pauses_other_watches(client):
+    watch = client.post("/api/watches", json=WATCH).json()
+    [opening] = client.post(f"/api/watches/{watch['id']}/check").json()["openings"]
+    watch = client.post(f"/api/openings/{opening['id']}/booked").json()
+    assert not watch["active"]
+    assert "Booked site 10" in watch["status_note"]
+    assert client.post("/api/openings/9999/booked").status_code == 404
+
+
+def test_editing_dates_keeps_progress_for_remaining_nights(client):
+    watch = client.post("/api/watches", json=PIECE).json()
+    for night in ["2027-07-10", "2027-07-11", "2027-07-12", "2027-07-13"]:
+        watch = set_nights(client, watch["id"], [night], "booked").json()
+    assert not watch["active"]
+
+    # Plans change: drop Jul 10, add Jul 14. Booked nights that remain are kept.
+    body = {
+        **PIECE,
+        "active": False,
+        "date_ranges": [{"check_in": "2027-07-11", "check_out": "2027-07-15"}],
+    }
+    watch = client.put(f"/api/watches/{watch['id']}", json=body).json()
+    assert statuses(watch) == {
+        "2027-07-11": "booked",
+        "2027-07-12": "booked",
+        "2027-07-13": "booked",
+        "2027-07-14": "needed",
+    }
+    assert watch["active"], "a new night to find restarts a finished watch"

@@ -22,6 +22,7 @@ from .providers import Campsite, Provider, ProviderError, RateLimitedError
 log = logging.getLogger(__name__)
 
 MAX_BACKOFF_SECONDS = 15 * 60
+MAX_HOLDS_PER_CYCLE = 3  # night by night: separate pieces held in one check
 
 
 @dataclass
@@ -110,7 +111,7 @@ class Checker:
         """Fetch each (provider, campground, month) once per cycle, however many watches need it."""
         needed: set[tuple[str, str, date]] = set()
         for watch in watches:
-            months = months_for(self._future_ranges(watch))
+            months = self._months(watch)
             for target in watch.targets:
                 needed.update((_provider(target), target["campground_id"], m) for m in months)
 
@@ -154,12 +155,26 @@ class Checker:
         today = self.today()
         return [(max(ci, today), co) for ci, co in watch.ranges() if co > today]
 
+    def _months(self, watch: Watch) -> list[date]:
+        if watch.piecemeal:  # only months that still have a night to find
+            return sorted({n.replace(day=1) for n in watch.needed_nights(self.today())})
+        return months_for(self._future_ranges(watch))
+
     async def _check_watch(
         self, db: Session, watch: Watch, data: dict, result: CycleResult
     ) -> None:
         now = utcnow()
+        today = self.today()
+        needed = watch.needed_nights(today) if watch.piecemeal else None
+        if needed is not None and not needed:
+            watch.update_completion(today)
+            _close_openings(watch, now)
+            watch.last_checked_at = now
+            result.watches_checked += 1
+            return
         ranges = self._future_ranges(watch)
-        months = months_for(ranges)
+        months = self._months(watch)
+        min_nights = 1 if watch.piecemeal else watch.min_nights
         found: dict[tuple[str, str, date, date], tuple[dict, object]] = {}
         errors = []
 
@@ -176,7 +191,12 @@ class Checker:
             campsites = merge_months(month_data)
             for check_in, check_out in ranges:
                 for stay in find_stays(
-                    campsites, check_in, check_out, watch.min_nights, target.get("sites") or []
+                    campsites,
+                    check_in,
+                    check_out,
+                    min_nights,
+                    target.get("sites") or [],
+                    needed=needed,
                 ):
                     key = (provider_key, stay.campsite_id, stay.check_in, stay.check_out)
                     found.setdefault(key, (target, stay))
@@ -219,7 +239,58 @@ class Checker:
         await self.notifier.send(_alert(watch, new))
         holdable = [o for o in new if o.provider == "recgov"]  # cart holds are Recreation.gov only
         if watch.action == "cart" and holdable and self.holder.available:
-            await self._hold(db, watch, holdable)
+            if watch.piecemeal:
+                await self._hold_pieces(watch, holdable)
+            else:
+                await self._hold(db, watch, holdable)
+
+    async def _hold_pieces(self, watch: Watch, candidates: list[Opening]) -> None:
+        """Night by night: hold as many still-needed nights as this check's openings allow.
+
+        Each hold covers only nights still needed, and the watch keeps going until every
+        night is booked, held or skipped.
+        """
+        today = self.today()
+        attempts = 0
+        for opening in sorted(candidates, key=_piece_priority(watch)):
+            run = _longest_run(opening, watch.needed_nights(today))
+            if not run:
+                continue  # an earlier hold this check already covered these nights
+            if attempts == MAX_HOLDS_PER_CYCLE:
+                break
+            attempts += 1
+            check_in, check_out = run[0], run[-1] + timedelta(days=1)
+            hold = await self.holder.hold(opening.campsite_id, check_in, check_out)
+            opening.cart_status = "held" if hold.ok else "failed"
+            opening.cart_message = hold.message[:500]
+            if not hold.ok:
+                await self.notifier.send(
+                    Notification(
+                        title=f"Couldn't hold site {opening.site}. Book it yourself",
+                        message=f"{opening.campground_name}, {_span(check_in, check_out)}. "
+                        f"{hold.message}",
+                        url=opening.book_url,
+                        url_label="Book now",
+                    )
+                )
+                continue
+            watch.mark_nights(run, "held", **_night_info(opening))
+            still = sorted(watch.needed_nights(today))
+            await self.notifier.send(
+                Notification(
+                    title=f"In your cart: site {opening.site}, {opening.campground_name}",
+                    message=f"{_span(check_in, check_out)}. Check out on Recreation.gov within "
+                    "about 15 minutes, or the hold expires. "
+                    + (
+                        f"Still looking for {_night_list(still)}."
+                        if still
+                        else "That covers every night."
+                    ),
+                    url="https://www.recreation.gov/cart",
+                    url_label="Go to cart",
+                )
+            )
+        watch.update_completion(today)
 
     async def _hold(self, db: Session, watch: Watch, new: list[Opening]) -> None:
         best = max(new, key=lambda o: ((o.check_out - o.check_in).days, -o.check_in.toordinal()))
@@ -253,6 +324,46 @@ def _provider(target: dict) -> str:
     return target.get("provider") or "recgov"
 
 
+def _night_info(opening: Opening) -> dict:
+    """What a booked or held night remembers about where it is."""
+    return {
+        "site": opening.site,
+        "campground_name": opening.campground_name,
+        "campsite_id": opening.campsite_id,
+        "provider": opening.provider,
+        "opening_id": opening.id,
+    }
+
+
+def _longest_run(opening: Opening, needed: set[date]) -> list[date]:
+    """The longest stretch of the opening's nights that's still needed (earliest on a tie)."""
+    best: list[date] = []
+    run: list[date] = []
+    for i in range((opening.check_out - opening.check_in).days + 1):
+        night = opening.check_in + timedelta(days=i)
+        if night < opening.check_out and night in needed:
+            run.append(night)
+            continue
+        if len(run) > len(best):
+            best = run
+        run = []
+    return best
+
+
+def _piece_priority(watch: Watch):
+    """Prefer extending a stay at a site you already have, then longer, then earlier."""
+    covered = watch.nights or {}
+
+    def key(o: Opening):
+        neighbours = (o.check_in - timedelta(days=1), o.check_out)
+        same_site = any(
+            covered.get(n.isoformat(), {}).get("campsite_id") == o.campsite_id for n in neighbours
+        )
+        return (not same_site, -(o.check_out - o.check_in).days, o.check_in)
+
+    return key
+
+
 def _close_openings(watch: Watch, now: datetime) -> None:
     for opening in watch.openings:
         if opening.gone_at is None:
@@ -263,9 +374,18 @@ def _day(d: date) -> str:
     return f"{d:%a %b} {d.day}"
 
 
+def _span(check_in: date, check_out: date) -> str:
+    nights = (check_out - check_in).days
+    return f"{_day(check_in)} to {_day(check_out)} ({nights} night{'s' * (nights != 1)})"
+
+
 def _dates(o: Opening) -> str:
-    nights = (o.check_out - o.check_in).days
-    return f"{_day(o.check_in)} to {_day(o.check_out)} ({nights} night{'s' * (nights != 1)})"
+    return _span(o.check_in, o.check_out)
+
+
+def _night_list(nights: list[date]) -> str:
+    shown = ", ".join(_day(n) for n in nights[:6])
+    return f"{shown} and {len(nights) - 6} more" if len(nights) > 6 else shown
 
 
 def _alert(watch: Watch, new: list[Opening]) -> Notification:
@@ -278,6 +398,10 @@ def _alert(watch: Watch, new: list[Opening]) -> Notification:
         lines += [f"  Site {o.site}: {_dates(o)}" for o in openings[:5]]
         if len(openings) > 5:
             lines.append(f"  and {len(openings) - 5} more")
+    if watch.piecemeal:
+        lines.append(
+            "After you book, tap “I booked it” in CampWatch so it keeps looking for the rest."
+        )
     first = new[0]
     count = f"{len(new)} opening{'s' * (len(new) != 1)}"
     return Notification(

@@ -240,7 +240,39 @@ p { margin: 0; }
   gap: 12px;
 }
 
+.opening-actions { display: grid; gap: 6px; flex: none; }
+
 .list-item { display: flex; gap: 12px; align-items: center; justify-content: space-between; }
+
+/* Night-by-night progress strip */
+.night-plan { display: grid; gap: 8px; }
+.night-strip { display: flex; gap: 6px; overflow-x: auto; padding-bottom: 2px; }
+.night {
+  flex: none;
+  display: grid;
+  justify-items: center;
+  gap: 1px;
+  min-width: 66px;
+  padding: 6px 8px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+}
+.night:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.night-day { font-size: 0.72rem; font-weight: 600; color: var(--muted); }
+.night-date { font-size: 0.9rem; font-weight: 700; }
+.night-status { font-size: 0.72rem; font-weight: 700; color: var(--muted); }
+.night.booked { background: var(--ok-soft); border-color: transparent; }
+.night.booked .night-status { color: var(--ok); }
+.night.held { background: var(--warn-soft); border-color: transparent; }
+.night.held .night-status { color: var(--warn); }
+.night.skipped { opacity: 0.6; }
+.night.skipped .night-date { text-decoration: line-through; }
+.night.past { opacity: 0.4; cursor: default; }
+.night-menu { display: grid; gap: 8px; padding: 10px 12px; border-radius: 10px; background: var(--surface-2); }
 .list-item.gone { opacity: 0.6; }
 
 /* Empty state */

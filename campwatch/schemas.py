@@ -66,12 +66,28 @@ class WatchIn(BaseModel):
     targets: list[Target] = Field(min_length=1, max_length=20)
     date_ranges: list[DateRange] = Field(min_length=1, max_length=30)
     min_nights: int | None = Field(None, ge=1, le=30)
+    # Night by night: take open nights as they come and keep looking for the rest.
+    piecemeal: bool = False
     action: Literal["alert", "cart"] = "alert"
     active: bool = True
 
 
 class WatchPatch(BaseModel):
     active: bool
+
+
+class NightsPatch(BaseModel):
+    """Set nights of a night-by-night watch to booked, held, skipped or needed (again)."""
+
+    nights: list[date] = Field(min_length=1, max_length=200)
+    status: Literal["booked", "held", "skipped", "needed"]
+
+
+class NightOut(BaseModel):
+    night: date
+    status: str  # "needed" | "booked" | "held" | "skipped"
+    site: str | None = None
+    campground_name: str | None = None
 
 
 class OpeningOut(BaseModel):
@@ -105,6 +121,7 @@ class WatchOut(WatchIn):
     last_checked_at: UtcDatetime | None
     last_error: str | None
     openings: list[OpeningOut] = Field(default_factory=list)
+    night_plan: list[NightOut] = Field(default_factory=list)
 
 
 class CampgroundOut(BaseModel):

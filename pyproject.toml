@@ -1,6 +1,6 @@
 [project]
 name = "campwatch"
-version = "2.2.0"
+version = "2.3.0"
 description = "Watch Recreation.gov campgrounds for openings, get phone alerts, and optionally hold a site in your cart."
 readme = "README.md"
 requires-python = ">=3.11"
