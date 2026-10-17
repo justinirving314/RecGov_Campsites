@@ -1,0 +1,12 @@
+services:
+  campwatch:
+    build:
+      context: .
+      args:
+        WITH_BOOKING: "false" # "true" adds the browser used by "hold in cart"
+    env_file: .env
+    volumes:
+      - ./data:/data
+    ports:
+      - "8000:8000"
+    restart: unless-stopped

@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+
+# Runtime data: SQLite database, generated secret key, booking screenshots
+data/
+
+# Secrets
+.env
+email_cred.json

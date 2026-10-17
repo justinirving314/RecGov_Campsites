@@ -1,0 +1,41 @@
+[project]
+name = "campwatch"
+version = "2.0.0"
+description = "Watch Recreation.gov campgrounds for openings, get phone alerts, and optionally hold a site in your cart."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "httpx>=0.27",
+    "sqlalchemy>=2.0",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+]
+
+[project.optional-dependencies]
+# Only needed for the "hold in cart" action. After installing, run: uv run playwright install chromium
+booking = ["playwright>=1.45"]
+
+[project.scripts]
+campwatch = "campwatch.__main__:main"
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.5"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["campwatch"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
