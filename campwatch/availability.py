@@ -6,7 +6,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date, timedelta
 
-from .recgov import AVAILABLE, Campsite
+from .providers import AVAILABLE, Campsite
 
 
 @dataclass(frozen=True)
@@ -41,6 +41,7 @@ def merge_months(months: Iterable[list[Campsite]]) -> list[Campsite]:
         for site in month:
             if site.campsite_id in merged:
                 merged[site.campsite_id].availability.update(site.availability)
+                merged[site.campsite_id].min_stay.update(site.min_stay)
             else:
                 merged[site.campsite_id] = Campsite(
                     campsite_id=site.campsite_id,
@@ -49,6 +50,7 @@ def merge_months(months: Iterable[list[Campsite]]) -> list[Campsite]:
                     campsite_type=site.campsite_type,
                     type_of_use=site.type_of_use,
                     availability=dict(site.availability),
+                    min_stay=dict(site.min_stay),
                 )
     return list(merged.values())
 
@@ -70,6 +72,7 @@ def find_stays(
     ``min_nights=None`` means the whole range must be open at a single site. A smaller value
     accepts any run of at least that many consecutive nights, reported as its longest run.
     ``sites`` limits the search to those site names; empty means any site.
+    A run shorter than the site's minimum stay for its first night is skipped.
     """
     window = nights_between(check_in, check_out)
     if not window:
@@ -88,7 +91,7 @@ def find_stays(
             if night is not None and site.availability.get(night) == AVAILABLE:
                 run.append(night)
                 continue
-            if len(run) >= needed:
+            if run and len(run) >= max(needed, site.min_stay.get(run[0], 1)):
                 stays.append(
                     Stay(
                         campsite_id=site.campsite_id,

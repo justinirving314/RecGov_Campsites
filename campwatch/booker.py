@@ -19,7 +19,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 from .config import Settings
-from .recgov import BASE_URL, campsite_url
+from .providers.recgov import BASE_URL, campsite_url
 
 log = logging.getLogger(__name__)
 

@@ -7,13 +7,13 @@ their response shape is kept in this module.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
 from datetime import date
 
 import httpx
 
+from . import Campground, Campsite, ProviderError, RateLimitedError, looks_like_link
+
 BASE_URL = "https://www.recreation.gov"
-AVAILABLE = "Available"
 
 HEADERS = {
     "Accept": "application/json",
@@ -26,33 +26,6 @@ HEADERS = {
 }
 
 _CAMPGROUND_URL = re.compile(r"/camping/campgrounds/(\d+)")
-
-
-class RecGovError(Exception):
-    """Recreation.gov returned an error or a response we couldn't parse."""
-
-
-class RateLimitedError(RecGovError):
-    """Recreation.gov answered 429 Too Many Requests."""
-
-
-@dataclass(frozen=True)
-class Campground:
-    id: str
-    name: str
-    parent_name: str = ""
-    location: str = ""
-
-
-@dataclass
-class Campsite:
-    campsite_id: str
-    site: str
-    loop: str = ""
-    campsite_type: str = ""
-    type_of_use: str = ""
-    # Night (check-in date) -> status string such as "Available" or "Reserved".
-    availability: dict[date, str] = field(default_factory=dict)
 
 
 def campsite_url(campsite_id: str) -> str:
@@ -76,7 +49,7 @@ def parse_month(payload: dict) -> list[Campsite]:
     try:
         raw_sites = payload["campsites"]
     except (KeyError, TypeError) as exc:
-        raise RecGovError("availability response has no 'campsites'") from exc
+        raise ProviderError("availability response has no 'campsites'") from exc
 
     sites = []
     for campsite_id, raw in raw_sites.items():
@@ -98,6 +71,9 @@ def parse_month(payload: dict) -> list[Campsite]:
 
 
 class RecGovClient:
+    key = "recgov"
+    label = "Recreation.gov"
+
     def __init__(self, http: httpx.AsyncClient):
         self._http = http
 
@@ -111,15 +87,15 @@ class RecGovClient:
         try:
             resp = await self._http.get(path, params=params)
         except httpx.HTTPError as exc:
-            raise RecGovError(f"request to {path} failed: {exc}") from exc
+            raise ProviderError(f"request to {path} failed: {exc}") from exc
         if resp.status_code == 429:
             raise RateLimitedError("Recreation.gov is rate limiting requests")
         if resp.status_code >= 400:
-            raise RecGovError(f"{path} returned HTTP {resp.status_code}")
+            raise ProviderError(f"{path} returned HTTP {resp.status_code}")
         try:
             return resp.json()
         except ValueError as exc:
-            raise RecGovError(f"{path} did not return JSON") from exc
+            raise ProviderError(f"{path} did not return JSON") from exc
 
     async def month_availability(self, campground_id: str, month: date) -> list[Campsite]:
         """All sites in a campground with their status for every night of ``month``.
@@ -138,17 +114,31 @@ class RecGovClient:
         info = payload.get("campground") or {}
         name = info.get("facility_name")
         if not name:
-            raise RecGovError(f"campground {campground_id} not found")
+            raise ProviderError(f"campground {campground_id} not found")
         address = (info.get("addresses") or [{}])[0]
         location = _location(address.get("city"), address.get("state_code"))
         return Campground(
+            provider=self.key,
             id=str(campground_id),
             name=_title(name),
             parent_name=info.get("parent_name") or "",
             location=location,
         )
 
-    async def search_campgrounds(self, query: str, limit: int = 15) -> list[Campground]:
+    async def search_campgrounds(self, query: str, limit: int = 10) -> list[Campground]:
+        """Search by name. Also accepts a pasted campground link or a bare ID."""
+        query = query.strip()
+        if campground_id := parse_campground_id(query):
+            try:
+                return [await self.campground(campground_id)]
+            except RateLimitedError:
+                raise
+            except ProviderError:
+                if query.isdigit():  # may be another system's ID
+                    return []
+                raise
+        if looks_like_link(query):
+            return []
         payload = await self._get_json(
             "/api/search",
             params={"q": query, "fq": "entity_type:campground", "size": limit, "start": 0},
@@ -163,13 +153,17 @@ class RecGovClient:
             location = _location(item.get("city"), item.get("state_code"))
             results.append(
                 Campground(
+                    provider=self.key,
                     id=str(entity_id),
                     name=_title(item.get("name") or str(entity_id)),
                     parent_name=item.get("parent_name") or "",
                     location=location,
                 )
             )
-        return results
+        return results[:limit]
+
+    def booking_url(self, target: dict, campsite_id: str) -> str:
+        return campsite_url(campsite_id)
 
 
 def _title(name: str) -> str:

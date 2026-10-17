@@ -18,10 +18,15 @@ def _as_utc(value: datetime) -> datetime:
 UtcDatetime = Annotated[datetime, AfterValidator(_as_utc)]
 
 
+Provider = Literal["recgov", "reservecalifornia"]
+
+
 class Target(BaseModel):
+    provider: Provider = "recgov"
     campground_id: str = Field(pattern=r"^\d{1,12}$")
     campground_name: str = Field("", max_length=200)
     location: str = Field("", max_length=200)
+    park_id: str = Field("", pattern=r"^\d{0,12}$")
     sites: list[str] = Field(default_factory=list, max_length=300)
 
     @field_validator("sites")
@@ -62,6 +67,7 @@ class OpeningOut(BaseModel):
     id: int
     watch_id: int
     watch_name: str
+    provider: str
     campground_id: str
     campground_name: str
     campsite_id: str
@@ -89,10 +95,17 @@ class WatchOut(WatchIn):
 
 
 class CampgroundOut(BaseModel):
+    provider: str
     id: str
     name: str
     parent_name: str = ""
     location: str = ""
+    park_id: str = ""
+
+
+class CampgroundSearchOut(BaseModel):
+    results: list[CampgroundOut]
+    errors: list[str] = Field(default_factory=list)  # systems whose search failed
 
 
 class SiteOut(BaseModel):

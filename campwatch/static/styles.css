@@ -318,6 +318,18 @@ input[type="number"] { width: 4.5em; text-align: center; padding: 8px; }
 .result:last-child { border-bottom: none; }
 .result:hover { background: var(--surface-2); }
 .result .sub { display: block; font-size: 0.82rem; color: var(--muted); }
+.result-title { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+.badge {
+  font-size: 0.7rem;
+  font-weight: 700;
+  padding: 2px 7px;
+  border-radius: 6px;
+  background: var(--surface-2);
+  color: var(--muted);
+  white-space: nowrap;
+}
+.badge.reservecalifornia { background: var(--warn-soft); color: var(--warn); }
 
 .target {
   border: 1px solid var(--border);

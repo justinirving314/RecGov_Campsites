@@ -7,7 +7,7 @@ import pytest
 from campwatch.booker import HoldResult
 from campwatch.checker import Checker
 from campwatch.models import Opening, Watch, make_session_factory
-from campwatch.recgov import Campsite, RateLimitedError, RecGovError
+from campwatch.providers import Campsite, ProviderError, RateLimitedError
 
 TODAY = date(2027, 6, 1)
 JULY = date(2027, 7, 1)
@@ -18,10 +18,15 @@ def d(day: int) -> date:
     return date(2027, 7, day)
 
 
-class FakeRecGov:
-    def __init__(self):
+class FakeProvider:
+    def __init__(self, key="recgov", label="Recreation.gov"):
+        self.key = key
+        self.label = label
         self.months: dict = {}
         self.calls: list = []
+
+    def booking_url(self, target, campsite_id):
+        return f"https://{self.key}.example/{target['campground_id']}/{campsite_id}"
 
     def set_open(self, campground_id: str, month: date, sites: dict[str, list[date]]):
         self.months[(campground_id, month)] = [
@@ -65,9 +70,16 @@ class FakeHolder:
 @pytest.fixture
 def env(tmp_path):
     sessions = make_session_factory(f"sqlite:///{tmp_path / 'test.db'}")
-    recgov, notifier, holder = FakeRecGov(), FakeNotifier(), FakeHolder()
+    recgov, notifier, holder = FakeProvider(), FakeNotifier(), FakeHolder()
+    providers = {"recgov": recgov, "reservecalifornia": FakeProvider("reservecalifornia", "CA")}
     checker = Checker(
-        sessions, recgov, notifier, holder, poll_interval=60, request_delay=0, today=lambda: TODAY
+        sessions,
+        providers,
+        notifier,
+        holder,
+        poll_interval=60,
+        request_delay=0,
+        today=lambda: TODAY,
     )
     return sessions, recgov, notifier, holder, checker
 
@@ -106,7 +118,7 @@ def test_new_opening_alerts_once_then_tracks_until_gone(env):
     assert result.new_openings == 1
     assert len(notifier.sent) == 1
     assert "Site 012" in notifier.sent[0].message
-    assert notifier.sent[0].url == "https://www.recreation.gov/camping/campsites/5012"
+    assert notifier.sent[0].url == "https://recgov.example/100001/5012"
 
     run(checker.check(None))
     assert len(notifier.sent) == 1, "same opening must not alert again"
@@ -195,7 +207,7 @@ def test_fetch_error_keeps_existing_openings(env):
     recgov.set_open(CAMPGROUND, JULY, {"5012": [d(10), d(11)]})
     run(checker.check(None))
 
-    recgov.months[(CAMPGROUND, JULY)] = RecGovError("HTTP 503")
+    recgov.months[(CAMPGROUND, JULY)] = ProviderError("HTTP 503")
     result = run(checker.check(None))
     assert result.errors
     [opening] = openings(sessions, watch_id)
@@ -266,5 +278,72 @@ def test_range_already_started_only_checks_remaining_nights(env):
     checker.today = lambda: d(11)
     add_watch(sessions)  # Jul 10 -> 12; only the night of the 11th is still bookable
     recgov.set_open(CAMPGROUND, JULY, {"5012": [d(11)]})
+    run(checker.check(None))
+    assert len(notifier.sent) == 1
+
+
+def ca_target(**kw):
+    return {
+        "provider": "reservecalifornia",
+        "campground_id": "766",
+        "campground_name": "Redwood Flat",
+        "park_id": "718",
+        "sites": [],
+        **kw,
+    }
+
+
+def test_mixed_providers_fetch_and_record_separately(env):
+    sessions, recgov, notifier, _, checker = env
+    ca = checker.providers["reservecalifornia"]
+    watch_id = add_watch(
+        sessions,
+        targets=[
+            {"campground_id": CAMPGROUND, "campground_name": "Pine Hollow", "sites": []},
+            ca_target(),
+        ],
+    )
+    # Same campsite ID in both systems must not be confused.
+    recgov.set_open(CAMPGROUND, JULY, {"5012": [d(10), d(11)]})
+    ca.set_open("766", JULY, {"5012": [d(10), d(11)]})
+    run(checker.check(None))
+
+    assert recgov.calls == [(CAMPGROUND, JULY)]
+    assert ca.calls == [("766", JULY)]
+    found = sorted((o.provider, o.book_url) for o in openings(sessions, watch_id))
+    assert found == [
+        ("recgov", "https://recgov.example/100001/5012"),
+        ("reservecalifornia", "https://reservecalifornia.example/766/5012"),
+    ]
+    assert len(notifier.sent) == 1
+
+
+def test_cart_hold_only_for_recreation_gov(env):
+    sessions, _, notifier, holder, checker = env
+    add_watch(sessions, action="cart", targets=[ca_target()])
+    checker.providers["reservecalifornia"].set_open("766", JULY, {"5012": [d(10), d(11)]})
+    run(checker.check(None))
+    assert holder.calls == []
+    assert len(notifier.sent) == 1
+
+
+def test_rate_limit_on_one_system_does_not_block_the_other(env):
+    sessions, recgov, notifier, _, checker = env
+    ca = checker.providers["reservecalifornia"]
+    add_watch(
+        sessions,
+        targets=[{"campground_id": CAMPGROUND, "campground_name": "Pine Hollow"}, ca_target()],
+    )
+    recgov.months[(CAMPGROUND, JULY)] = RateLimitedError("slow down")
+    ca.set_open("766", JULY, {"5012": [d(10), d(11)]})
+    run(checker.check(None))
+    assert checker.state.backoff_seconds == 60
+    assert len(notifier.sent) == 1
+
+
+def test_old_watches_without_provider_default_to_recreation_gov(env):
+    sessions, recgov, notifier, _, checker = env
+    add_watch(sessions, targets=[{"campground_id": CAMPGROUND, "campground_name": "Old"}])
+    recgov.set_open(CAMPGROUND, JULY, {"5012": [d(10), d(11)]})
     run(checker.check(None))
     assert len(notifier.sent) == 1

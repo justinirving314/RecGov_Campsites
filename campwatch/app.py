@@ -24,9 +24,12 @@ from .checker import Checker
 from .config import Settings
 from .models import Opening, Watch, make_session_factory
 from .notify import Notification, Notifier
-from .recgov import RecGovClient, RecGovError, parse_campground_id
+from .providers import Provider, ProviderError
+from .providers.recgov import RecGovClient
+from .providers.reservecalifornia import ReserveCaliforniaClient
 from .schemas import (
     CampgroundOut,
+    CampgroundSearchOut,
     LoginIn,
     OpeningOut,
     SiteOut,
@@ -55,14 +58,19 @@ def create_app(
     async def lifespan(app: FastAPI):
         async with (
             RecGovClient.create_http(transport=transport) as recgov_http,
+            ReserveCaliforniaClient.create_http(transport=transport) as reservecalifornia_http,
             httpx.AsyncClient(timeout=20.0, transport=transport) as http,
         ):
-            app.state.recgov = RecGovClient(recgov_http)
+            providers: list[Provider] = [
+                RecGovClient(recgov_http),
+                ReserveCaliforniaClient(reservecalifornia_http, today=today),
+            ]
+            app.state.providers = {p.key: p for p in providers}
             app.state.notifier = Notifier(settings, http)
             app.state.holder = CartHolder(settings)
             app.state.checker = Checker(
                 app.state.sessions,
-                app.state.recgov,
+                app.state.providers,
                 app.state.notifier,
                 app.state.holder,
                 poll_interval=settings.poll_interval_seconds,
@@ -237,38 +245,54 @@ def list_openings(db: DB, limit: Annotated[int, Query(ge=1, le=500)] = 100) -> l
 # --- Campground lookup ---------------------------------------------------------------------
 
 
+ProviderKey = Annotated[str, Query(pattern=r"^[a-z]+$")]
+
+
 @api.get("/campgrounds/search")
 async def search_campgrounds(
-    request: Request, q: Annotated[str, Query(min_length=2, max_length=100)]
-) -> list[CampgroundOut]:
-    client: RecGovClient = request.app.state.recgov
-    try:
-        if campground_id := parse_campground_id(q):
-            return [CampgroundOut(**vars(await client.campground(campground_id)))]
-        return [CampgroundOut(**vars(c)) for c in await client.search_campgrounds(q)]
-    except RecGovError as exc:
-        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
+    request: Request, q: Annotated[str, Query(min_length=2, max_length=200)]
+) -> CampgroundSearchOut:
+    """Search every reservation system at once. One failing doesn't hide the others' results."""
+    providers: list[Provider] = list(request.app.state.providers.values())
+    outcomes = await asyncio.gather(
+        *(p.search_campgrounds(q) for p in providers), return_exceptions=True
+    )
+    results, errors = [], []
+    for provider, outcome in zip(providers, outcomes, strict=True):
+        if isinstance(outcome, ProviderError):
+            errors.append(f"{provider.label}: {outcome}")
+        elif isinstance(outcome, BaseException):
+            raise outcome
+        else:
+            results += [CampgroundOut(**vars(c)) for c in outcome]
+    return CampgroundSearchOut(results=results, errors=errors)
 
 
 @api.get("/campgrounds/{campground_id}")
-async def get_campground(campground_id: str, request: Request) -> CampgroundOut:
+async def get_campground(
+    campground_id: str, request: Request, provider: ProviderKey = "recgov"
+) -> CampgroundOut:
     _check_id(campground_id)
     try:
-        return CampgroundOut(**vars(await request.app.state.recgov.campground(campground_id)))
-    except RecGovError as exc:
+        found = await _get_provider(request, provider).campground(campground_id)
+    except ProviderError as exc:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
+    return CampgroundOut(**vars(found))
 
 
 @api.get("/campgrounds/{campground_id}/sites")
 async def list_sites(
-    campground_id: str, request: Request, month: date | None = None
+    campground_id: str,
+    request: Request,
+    month: date | None = None,
+    provider: ProviderKey = "recgov",
 ) -> list[SiteOut]:
     _check_id(campground_id)
     try:
-        sites = await request.app.state.recgov.month_availability(
+        sites = await _get_provider(request, provider).month_availability(
             campground_id, month or date.today()
         )
-    except RecGovError as exc:
+    except ProviderError as exc:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
     sites.sort(key=lambda s: (_natural(s.loop), _natural(s.site)))
     return [
@@ -278,9 +302,16 @@ async def list_sites(
     ]
 
 
+def _get_provider(request: Request, key: str) -> Provider:
+    try:
+        return request.app.state.providers[key]
+    except KeyError:
+        raise HTTPException(422, "Unknown provider") from None
+
+
 def _check_id(campground_id: str) -> None:
     if not campground_id.isdigit():
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Campground IDs are numbers")
+        raise HTTPException(422, "Campground IDs are numbers")
 
 
 def _natural(text: str) -> list[tuple[int, int | str]]:

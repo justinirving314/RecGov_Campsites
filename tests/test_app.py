@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 
 from campwatch.app import create_app
 from campwatch.config import Settings
-from tests.helpers import month_payload
+from tests.helpers import CA_FACILITIES, CA_PLACES, grid_payload, month_payload
 
 TODAY = date(2027, 6, 1)
 
@@ -23,12 +23,28 @@ class FakeInternet:
     def __init__(self):
         self.requests: list[httpx.Request] = []
         self.open_nights = {date(2027, 7, 10), date(2027, 7, 11)}
+        self.ca_down = False
+
+    def ca_grid(self, body: dict) -> dict:
+        start, end = _mdy(body["StartDate"]), _mdy(body["EndDate"])
+        units = {"1": ("Site 012", self.open_nights), "2": ("Site 013", set())}
+        return grid_payload(start, end, units)
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
         path = request.url.path
         if request.url.host == "ntfy.example":
             return httpx.Response(200, json={"id": "x"})
+        if request.url.host.endswith("tylerapp.com"):  # ReserveCalifornia
+            if self.ca_down:
+                return httpx.Response(503)
+            if path == "/rdr/fd/places":
+                return httpx.Response(200, json=CA_PLACES)
+            if path == "/rdr/fd/facilities":
+                return httpx.Response(200, json=CA_FACILITIES)
+            if path == "/rdr/search/grid":
+                return httpx.Response(200, json=self.ca_grid(json.loads(request.content)))
+            return httpx.Response(404)
         if path.endswith("/month"):
             month = date.fromisoformat(request.url.params["start_date"][:10])
             return httpx.Response(
@@ -56,6 +72,11 @@ class FakeInternet:
         if path.startswith("/api/camps/campgrounds/"):
             return httpx.Response(200, json={"campground": {"facility_name": "PINE HOLLOW"}})
         return httpx.Response(404)
+
+
+def _mdy(text: str) -> date:
+    month, day, year = map(int, text.split("-"))
+    return date(year, month, day)
 
 
 def make_client(tmp_path, internet=None, **settings) -> TestClient:
@@ -156,13 +177,78 @@ def test_openings_feed(client):
     assert opening["gone_at"] is None
 
 
+def search(client, q):
+    resp = client.get("/api/campgrounds/search", params={"q": q})
+    assert resp.status_code == 200
+    return resp.json()
+
+
 def test_campground_search_and_link_paste(client):
-    [by_name] = client.get("/api/campgrounds/search", params={"q": "pine"}).json()
-    assert by_name == {"id": "100001", "name": "Pine Hollow", "parent_name": "", "location": ""}
+    by_name = search(client, "pine")
+    assert by_name["errors"] == []
+    assert by_name["results"] == [
+        {
+            "provider": "recgov",
+            "id": "100001",
+            "name": "Pine Hollow",
+            "parent_name": "",
+            "location": "",
+            "park_id": "",
+        }
+    ]
 
     url = "https://www.recreation.gov/camping/campgrounds/100001"
-    [by_link] = client.get("/api/campgrounds/search", params={"q": url}).json()
+    [by_link] = search(client, url)["results"]
     assert by_link["id"] == "100001"
+
+
+def test_search_covers_california_state_parks(client):
+    found = search(client, "https://www.reservecalifornia.com/park/718/766")["results"]
+    assert [(c["provider"], c["id"], c["park_id"]) for c in found] == [
+        ("reservecalifornia", "766", "718")
+    ]
+    by_id = search(client, "801")["results"]
+    assert {c["provider"] for c in by_id} == {"recgov", "reservecalifornia"}
+
+
+def test_search_reports_a_failing_system_but_keeps_the_others(tmp_path):
+    internet = FakeInternet()
+    internet.ca_down = True
+    with make_client(tmp_path, internet) as c:
+        result = search(c, "pine")
+    assert [r["provider"] for r in result["results"]] == ["recgov"]
+    assert result["errors"] and result["errors"][0].startswith("CA State Parks")
+
+
+def test_california_watch_alerts_with_park_booking_link(client):
+    watch = client.post(
+        "/api/watches",
+        json={
+            **WATCH,
+            "targets": [
+                {
+                    "provider": "reservecalifornia",
+                    "campground_id": "766",
+                    "campground_name": "Redwood Flat Campground",
+                    "park_id": "718",
+                }
+            ],
+        },
+    ).json()
+    [opening] = client.post(f"/api/watches/{watch['id']}/check").json()["openings"]
+    assert opening["provider"] == "reservecalifornia"
+    assert opening["site"] == "012"
+    assert opening["book_url"] == "https://www.reservecalifornia.com/park/718/766"
+
+
+def test_california_sites_list(client):
+    sites = client.get(
+        "/api/campgrounds/766/sites",
+        params={"month": "2027-07-01", "provider": "reservecalifornia"},
+    ).json()
+    assert [s["site"] for s in sites] == ["012", "013"]
+    bad = client.get("/api/campgrounds/766/sites", params={"provider": "nope"})
+    assert bad.status_code == 422
 
 
 def test_sites_are_sorted_naturally_without_day_use(client):

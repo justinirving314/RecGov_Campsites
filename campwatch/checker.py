@@ -17,7 +17,7 @@ from .availability import find_stays, merge_months, months_for
 from .booker import CartHolder
 from .models import Opening, Watch, utcnow
 from .notify import Notification, Notifier
-from .recgov import Campsite, RateLimitedError, RecGovClient, RecGovError, campsite_url
+from .providers import Campsite, Provider, ProviderError, RateLimitedError
 
 log = logging.getLogger(__name__)
 
@@ -44,7 +44,7 @@ class Checker:
     def __init__(
         self,
         sessions: sessionmaker,
-        client: RecGovClient,
+        providers: dict[str, Provider],
         notifier: Notifier,
         holder: CartHolder,
         poll_interval: int,
@@ -52,7 +52,7 @@ class Checker:
         today=date.today,
     ):
         self.sessions = sessions
-        self.client = client
+        self.providers = providers
         self.notifier = notifier
         self.holder = holder
         self.poll_interval = poll_interval
@@ -106,35 +106,48 @@ class Checker:
 
     async def _fetch(
         self, watches: list[Watch], result: CycleResult
-    ) -> dict[tuple[str, date], list[Campsite] | RecGovError]:
-        """Fetch each (campground, month) once per cycle, however many watches need it."""
-        needed: set[tuple[str, date]] = set()
+    ) -> dict[tuple[str, str, date], list[Campsite] | ProviderError]:
+        """Fetch each (provider, campground, month) once per cycle, however many watches need it."""
+        needed: set[tuple[str, str, date]] = set()
         for watch in watches:
             months = months_for(self._future_ranges(watch))
             for target in watch.targets:
-                needed.update((target["campground_id"], m) for m in months)
+                needed.update((_provider(target), target["campground_id"], m) for m in months)
 
-        data: dict[tuple[str, date], list[Campsite] | RecGovError] = {}
-        for i, (campground_id, month) in enumerate(sorted(needed)):
-            if i and self.request_delay:
+        data: dict[tuple[str, str, date], list[Campsite] | ProviderError] = {}
+        rate_limited = False
+        sent = 0
+        for key in sorted(needed):
+            if key in data:  # skipped after that system rate limited us
+                continue
+            provider_key, campground_id, month = key
+            provider = self.providers.get(provider_key)
+            if provider is None:
+                data[key] = ProviderError(f"unknown reservation system {provider_key!r}")
+                result.errors.append(str(data[key]))
+                continue
+            if sent and self.request_delay:
                 await asyncio.sleep(self.request_delay)
+            sent += 1
             try:
-                data[(campground_id, month)] = await self.client.month_availability(
-                    campground_id, month
-                )
+                data[key] = await provider.month_availability(campground_id, month)
                 result.requests += 1
             except RateLimitedError as exc:
-                self.state.backoff_seconds = min(
-                    max(self.state.backoff_seconds * 2, 60), MAX_BACKOFF_SECONDS
-                )
+                # Stop asking this system for the rest of the cycle; others carry on.
+                rate_limited = True
                 result.errors.append(str(exc))
-                for key in needed - data.keys():
-                    data[key] = exc
-                return data
-            except RecGovError as exc:
-                result.errors.append(f"{campground_id} {month:%b %Y}: {exc}")
-                data[(campground_id, month)] = exc
-        self.state.backoff_seconds = 0
+                for other in needed:
+                    if other[0] == provider_key and other not in data:
+                        data[other] = exc
+            except ProviderError as exc:
+                result.errors.append(f"{provider.label} {campground_id} {month:%b %Y}: {exc}")
+                data[key] = exc
+        if rate_limited:
+            self.state.backoff_seconds = min(
+                max(self.state.backoff_seconds * 2, 60), MAX_BACKOFF_SECONDS
+            )
+        else:
+            self.state.backoff_seconds = 0
         return data
 
     def _future_ranges(self, watch: Watch) -> list[tuple[date, date]]:
@@ -147,11 +160,12 @@ class Checker:
         now = utcnow()
         ranges = self._future_ranges(watch)
         months = months_for(ranges)
-        found: dict[tuple[str, date, date], tuple[dict, object]] = {}
+        found: dict[tuple[str, str, date, date], tuple[dict, object]] = {}
         errors = []
 
         for target in watch.targets:
-            month_data = [data.get((target["campground_id"], m)) for m in months]
+            provider_key = _provider(target)
+            month_data = [data.get((provider_key, target["campground_id"], m)) for m in months]
             failures = [d for d in month_data if not isinstance(d, list)]
             if failures:
                 errors.append(
@@ -164,7 +178,7 @@ class Checker:
                 for stay in find_stays(
                     campsites, check_in, check_out, watch.min_nights, target.get("sites") or []
                 ):
-                    key = (stay.campsite_id, stay.check_in, stay.check_out)
+                    key = (provider_key, stay.campsite_id, stay.check_in, stay.check_out)
                     found.setdefault(key, (target, stay))
 
         result.watches_checked += 1
@@ -183,6 +197,8 @@ class Checker:
             if key in current:
                 continue
             opening = Opening(
+                provider=key[0],
+                booking_url=self.providers[key[0]].booking_url(target, stay.campsite_id),
                 campground_id=target["campground_id"],
                 campground_name=target.get("campground_name") or target["campground_id"],
                 campsite_id=stay.campsite_id,
@@ -201,8 +217,9 @@ class Checker:
         result.new_openings += len(new)
         db.commit()
         await self.notifier.send(_alert(watch, new))
-        if watch.action == "cart" and self.holder.available:
-            await self._hold(db, watch, new)
+        holdable = [o for o in new if o.provider == "recgov"]  # cart holds are Recreation.gov only
+        if watch.action == "cart" and holdable and self.holder.available:
+            await self._hold(db, watch, holdable)
 
     async def _hold(self, db: Session, watch: Watch, new: list[Opening]) -> None:
         best = max(new, key=lambda o: ((o.check_out - o.check_in).days, -o.check_in.toordinal()))
@@ -226,10 +243,14 @@ class Checker:
                 Notification(
                     title=f"Couldn't hold site {best.site}. Book it yourself",
                     message=f"{best.campground_name}, {_dates(best)}. {hold.message}",
-                    url=campsite_url(best.campsite_id),
+                    url=best.book_url,
                     url_label="Book now",
                 )
             )
+
+
+def _provider(target: dict) -> str:
+    return target.get("provider") or "recgov"
 
 
 def _close_openings(watch: Watch, now: datetime) -> None:
@@ -262,6 +283,6 @@ def _alert(watch: Watch, new: list[Opening]) -> Notification:
     return Notification(
         title=f"{count}: {watch.name}",
         message="\n".join(lines),
-        url=campsite_url(first.campsite_id),
+        url=first.book_url,
         url_label=f"Book site {first.site}",
     )

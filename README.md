@@ -1,11 +1,11 @@
 # CampWatch
 
-Watch Recreation.gov campgrounds for cancellations and get an alert on your phone the moment a site opens up. You can also have it put the site in your Recreation.gov cart so it's held while you pay.
+Watch campgrounds on **Recreation.gov** (national parks and forests, Army Corps lakes and more) and **ReserveCalifornia** (California State Parks) for cancellations, and get an alert on your phone the moment a site opens up. For Recreation.gov sites, you can also have it put the site in your cart so it's held while you pay.
 
-- **Watches.** Each watch covers one or more campgrounds (optionally only certain sites) and one or more sets of dates. Add as many watches as you like.
+- **Watches.** Each watch covers one or more campgrounds (optionally only certain sites) and one or more sets of dates. A single watch can mix Recreation.gov and California State Parks campgrounds. Add as many watches as you like.
 - **Stay rules.** Ask for the whole stay at one site, or for any N nights in a row within a wider window, such as "any 2 nights in July".
 - **Alerts.** Push notifications through [ntfy](https://ntfy.sh) or [Pushover](https://pushover.net), or email. Each alert has a "Book" link that opens the site's page. You're alerted once per opening, not every minute.
-- **Hold in cart (optional, experimental).** CampWatch signs in to your Recreation.gov account and adds the site to your cart. You then have about 15 minutes to pay. Payment is always left to you.
+- **Hold in cart (optional, experimental, Recreation.gov only).** CampWatch signs in to your Recreation.gov account and adds the site to your cart. You then have about 15 minutes to pay. Payment is always left to you.
 - **Web app and iPhone app.** One mobile-first web app. On iPhone, add it to your home screen and it opens full screen like a native app.
 
 <p>
@@ -66,6 +66,19 @@ Configure any combination in `.env`:
 | Pushover | `CAMPWATCH_PUSHOVER_USER_KEY`, `CAMPWATCH_PUSHOVER_APP_TOKEN` | One-time purchase, very reliable. |
 | Email | `CAMPWATCH_SMTP_*`, `CAMPWATCH_EMAIL_TO` | For Gmail: `smtp.gmail.com`, port 465, and a [Google app password](https://myaccount.google.com/apppasswords). |
 
+## California State Parks
+
+Search for a state park or campground by name (for example "Big Basin" or "Pfeiffer"), or paste a ReserveCalifornia link such as `https://www.reservecalifornia.com/park/718/766`. A link to a park without a campground number lists all of that park's campgrounds. Search results are labelled **CA State Parks** or **Recreation.gov**.
+
+Watching works the same as for Recreation.gov, with these differences:
+
+- The **Book** link opens the campground's page on ReserveCalifornia, not the exact site, because ReserveCalifornia has no per-site link. The alert tells you which site number to pick.
+- **No cart holds.** ReserveCalifornia openings always alert only, even on a watch set to "hold in cart". Some of its campgrounds use CAPTCHAs, and holding would need a separate, site-specific automation.
+- **Minimum stays are respected.** Many parks require 2 nights on summer weekends. A single open night that can't be booked alone doesn't trigger an alert.
+- Campground search uses ReserveCalifornia's list of every park and facility, which CampWatch downloads once a day.
+
+ReserveCalifornia is run for California State Parks by Tyler Technologies. Its terms apply to automated access just as Recreation.gov's do.
+
 ## Hold in cart (experimental)
 
 When a watch is set to **Alert me and hold the site in my Recreation.gov cart**, CampWatch:
@@ -94,13 +107,15 @@ All settings are environment variables, or lines in `.env`. See [`.env.example`]
 | `CAMPWATCH_REQUEST_DELAY_SECONDS` | `1.0` | Pause between requests within a check. |
 | `CAMPWATCH_DATA_DIR` | `data` | Location of the SQLite database, the session key and screenshots. |
 
-If Recreation.gov answers "too many requests", CampWatch backs off automatically, up to an extra 15 minutes, and shows the delay on the Settings tab.
+If either reservation system answers "too many requests", CampWatch backs off automatically, up to an extra 15 minutes, and shows the delay on the Settings tab. A rate limit from one system doesn't stop checks against the other.
 
 ## How it works
 
 ```
 campwatch/
-  recgov.py        Recreation.gov client (availability, campground search and details)
+  providers/
+    recgov.py             Recreation.gov client (availability, campground search and details)
+    reservecalifornia.py  ReserveCalifornia (CA State Parks) client
   availability.py  Pure logic: which months to fetch, which stays are open
   checker.py       Polling loop: fetch, match, record openings, alert, optionally hold
   notify.py        ntfy, Pushover and email
@@ -111,7 +126,9 @@ campwatch/
 tests/             pytest with synthetic data and a mocked network
 ```
 
-- Availability comes from `GET /api/camps/availability/campground/{id}/month`, the same undocumented endpoint the Recreation.gov website uses. It returns a whole campground for one calendar month. Each check fetches each (campground, month) pair once, however many watches need it.
+- Recreation.gov availability comes from `GET /api/camps/availability/campground/{id}/month`, the same undocumented endpoint its website uses. It returns a whole campground for one calendar month.
+- ReserveCalifornia availability comes from `POST /rdr/search/grid` on its Tyler Technologies backend, also undocumented. CampWatch asks for one calendar month at a time so both systems work the same way.
+- Each check fetches each (system, campground, month) once, however many watches need it.
 - An **opening** is a run of consecutive "Available" nights at one site that meets the watch's stay rule. CampWatch remembers the openings it has already alerted on. An opening that disappears and later comes back triggers a new alert.
 - A watch stops by itself once all its dates have passed.
 
@@ -125,8 +142,11 @@ uv run pytest
 uv run ruff check . && uv run ruff format .
 ```
 
-The tests use only synthetic campgrounds and a mocked network, so they never contact Recreation.gov.
+The tests use only synthetic campgrounds and a mocked network, so they never contact Recreation.gov or ReserveCalifornia.
 
 ## Finding a campground ID
 
-You usually don't need one: search by name in the app, or paste the campground's link. The ID is the number in a URL like `https://www.recreation.gov/camping/campgrounds/232447`.
+You usually don't need one: search by name in the app, or paste the campground's link.
+
+- Recreation.gov: the number in `https://www.recreation.gov/camping/campgrounds/232447`.
+- ReserveCalifornia: the second number in `https://www.reservecalifornia.com/park/718/766` (718 is the park, 766 the campground).

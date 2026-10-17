@@ -4,13 +4,8 @@ from datetime import date
 import httpx
 import pytest
 
-from campwatch.recgov import (
-    RateLimitedError,
-    RecGovClient,
-    RecGovError,
-    parse_campground_id,
-    parse_month,
-)
+from campwatch.providers import ProviderError, RateLimitedError
+from campwatch.providers.recgov import RecGovClient, parse_campground_id, parse_month
 from tests.helpers import month_payload
 
 
@@ -32,7 +27,7 @@ def test_parse_month_reads_sites_and_nights():
 
 
 def test_parse_month_rejects_unexpected_shape():
-    with pytest.raises(RecGovError):
+    with pytest.raises(ProviderError):
         parse_month({"error": "nope"})
 
 
@@ -52,8 +47,8 @@ def test_month_availability_always_asks_for_first_of_month():
     ("response", "error"),
     [
         (httpx.Response(429), RateLimitedError),
-        (httpx.Response(500), RecGovError),
-        (httpx.Response(200, text="<html>maintenance</html>"), RecGovError),
+        (httpx.Response(500), ProviderError),
+        (httpx.Response(200, text="<html>maintenance</html>"), ProviderError),
     ],
 )
 def test_errors_are_raised_as_recgov_errors(response, error):
@@ -66,7 +61,7 @@ def test_network_failure_is_a_recgov_error():
     def handler(request):
         raise httpx.ConnectError("boom", request=request)
 
-    with pytest.raises(RecGovError):
+    with pytest.raises(ProviderError):
         run(client_for(handler).month_availability("100001", date(2027, 7, 1)))
 
 
@@ -119,7 +114,7 @@ def test_campground_details():
 
 
 def test_campground_missing_is_error():
-    with pytest.raises(RecGovError):
+    with pytest.raises(ProviderError):
         run(client_for(lambda r: httpx.Response(200, json={"campground": {}})).campground("1"))
 
 
@@ -134,3 +129,24 @@ def test_campground_missing_is_error():
 )
 def test_parse_campground_id(text, expected):
     assert parse_campground_id(text) == expected
+
+
+def test_search_resolves_pasted_link():
+    def handler(request):
+        assert request.url.path == "/api/camps/campgrounds/100001"
+        return httpx.Response(200, json={"campground": {"facility_name": "PINE HOLLOW"}})
+
+    url = "https://www.recreation.gov/camping/campgrounds/100001"
+    [found] = run(client_for(handler).search_campgrounds(url))
+    assert (found.provider, found.id, found.name) == ("recgov", "100001", "Pine Hollow")
+
+
+def test_search_ignores_other_systems_links_and_unknown_ids():
+    def handler(request):
+        if request.url.path.startswith("/api/camps/campgrounds/"):
+            return httpx.Response(404)
+        raise AssertionError(f"unexpected request {request.url}")
+
+    client = client_for(handler)
+    assert run(client.search_campgrounds("https://www.reservecalifornia.com/park/1/2")) == []
+    assert run(client.search_campgrounds("766")) == []

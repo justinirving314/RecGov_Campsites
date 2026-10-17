@@ -115,8 +115,17 @@ function stayLabel(w) {
   return w.min_nights ? `Any ${w.min_nights}+ nights in a row` : 'Whole stay at one site';
 }
 
+const PROVIDERS = { recgov: 'Recreation.gov', reservecalifornia: 'CA State Parks' };
+const providerOf = (t) => t.provider || 'recgov';
+
+function providerBadge(t) {
+  const key = providerOf(t);
+  return h('span', { class: `badge ${key}` }, PROVIDERS[key] || key);
+}
+
 function campgroundLabel(t) {
-  const name = t.campground_name || `Campground ${t.campground_id}`;
+  const base = t.campground_name || `Campground ${t.campground_id}`;
+  const name = providerOf(t) === 'recgov' ? base : `${base} (${PROVIDERS[providerOf(t)]})`;
   return t.sites.length ? `${name} (${t.sites.length} site${t.sites.length === 1 ? '' : 's'})` : name;
 }
 
@@ -265,7 +274,7 @@ async function renderEditor(id) {
   const results = h('div', { class: 'results' });
   const search = h('input', {
     type: 'search',
-    placeholder: 'Campground name or recreation.gov link',
+    placeholder: 'Campground or park name, or a booking link',
     autocomplete: 'off',
     enterkeyhint: 'search',
     'aria-label': 'Search campgrounds',
@@ -280,22 +289,32 @@ async function renderEditor(id) {
       const mine = ++searchSeq;
       results.replaceChildren(h('div', { class: 'muted small pad' }, 'Searching…'));
       try {
-        const found = await api(`/campgrounds/search?q=${encodeURIComponent(q)}`);
+        const { results: found, errors } = await api(`/campgrounds/search?q=${encodeURIComponent(q)}`);
         if (mine !== searchSeq) return;
-        results.replaceChildren(...(found.length
-          ? found.map((c) => h('button', {
+        results.replaceChildren(
+          ...found.map((c) => h('button', {
             class: 'result',
             type: 'button',
             onclick: () => {
-              if (!draft.targets.some((t) => t.campground_id === c.id)) {
-                draft.targets.push({ campground_id: c.id, campground_name: c.name, location: [c.parent_name, c.location].filter(Boolean).join(' · '), sites: [] });
+              if (!draft.targets.some((t) => t.campground_id === c.id && providerOf(t) === c.provider)) {
+                draft.targets.push({
+                  provider: c.provider,
+                  campground_id: c.id,
+                  campground_name: c.name,
+                  location: [c.parent_name, c.location].filter(Boolean).join(' · '),
+                  park_id: c.park_id || '',
+                  sites: [],
+                });
               }
               search.value = '';
               results.replaceChildren();
               drawTargets();
             },
-          }, c.name, h('span', { class: 'sub' }, [c.parent_name, c.location].filter(Boolean).join(' · ') || `ID ${c.id}`)))
-          : [h('div', { class: 'muted small pad' }, 'No campgrounds found. Try another name, or paste the campground link.')]));
+          },
+          h('span', { class: 'result-title' }, c.name, providerBadge(c)),
+          h('span', { class: 'sub' }, [c.parent_name, c.location].filter(Boolean).join(' · ') || `ID ${c.id}`))),
+          ...errors.map((e) => h('div', { class: 'error-text pad' }, `Search failed for ${e}`)),
+          ...(found.length || errors.length ? [] : [h('div', { class: 'muted small pad' }, 'No campgrounds found. Try another name, or paste the campground link.')]));
       } catch (err) {
         if (mine === searchSeq) results.replaceChildren(h('div', { class: 'error-text pad' }, err.message));
       }
@@ -326,7 +345,7 @@ async function renderEditor(id) {
     return h('div', { class: 'target' },
       h('div', { class: 'target-head' },
         h('div', {},
-          h('strong', {}, t.campground_name || `Campground ${t.campground_id}`),
+          h('div', { class: 'result-title' }, h('strong', {}, t.campground_name || `Campground ${t.campground_id}`), providerBadge(t)),
           h('div', { class: 'small muted' }, t.location || `ID ${t.campground_id}`)),
         h('button', { class: 'icon-btn', type: 'button', 'aria-label': 'Remove campground', onclick: onRemove }, '×')),
       h('div', {}, summary),
@@ -397,7 +416,14 @@ async function renderEditor(id) {
       }
       const body = {
         name: name.value.trim(),
-        targets: draft.targets.map(({ campground_id, campground_name, location, sites }) => ({ campground_id, campground_name, location: location || '', sites })),
+        targets: draft.targets.map((t) => ({
+          provider: providerOf(t),
+          campground_id: t.campground_id,
+          campground_name: t.campground_name,
+          location: t.location || '',
+          park_id: t.park_id || '',
+          sites: t.sites,
+        })),
         date_ranges: ranges.map(({ check_in, check_out }) => ({ check_in, check_out })),
         min_nights: flexStay.checked ? Number(minNights.value) || 1 : null,
         action: holdCart.checked ? 'cart' : 'alert',
@@ -417,7 +443,7 @@ async function renderEditor(id) {
     targetsBox,
     search,
     results,
-    h('p', { class: 'hint' }, 'Add as many as you like. Any of them will do. To watch only certain sites, tap “Any site”.')),
+    h('p', { class: 'hint' }, 'Searches Recreation.gov and ReserveCalifornia (CA State Parks). Add as many as you like; any of them will do. To watch only certain sites, tap “Any site”.')),
   h('fieldset', {},
     h('legend', {}, 'Dates'),
     datesBox,
@@ -439,7 +465,7 @@ async function renderEditor(id) {
         'Alert me and hold the site in my Recreation.gov cart',
         h('span', { class: 'hint', style: 'display:block' },
           cart.available
-            ? 'Experimental. You’ll have about 15 minutes to sign in and pay. The watch pauses after a successful hold.'
+            ? 'Experimental, Recreation.gov sites only (CA State Parks sites still alert). You’ll have about 15 minutes to sign in and pay. The watch pauses after a successful hold.'
             : `Not set up yet. ${cart.reason || ''}`)))),
   h('fieldset', {},
     h('legend', {}, 'Name'),
@@ -467,11 +493,11 @@ async function fillPicker(t, picker, onChange, draft) {
   picker.replaceChildren(h('div', { class: 'muted small' }, 'Loading sites…'));
   const firstDate = draft.date_ranges.map((r) => r.check_in).filter(Boolean).sort()[0];
   const month = firstDate || isoDay(new Date());
-  const cacheKey = `${t.campground_id}:${month.slice(0, 7)}`;
+  const cacheKey = `${providerOf(t)}:${t.campground_id}:${month.slice(0, 7)}`;
   let sites = state.siteCache.get(cacheKey);
   try {
     if (!sites) {
-      sites = await api(`/campgrounds/${t.campground_id}/sites?month=${month.slice(0, 7)}-01`);
+      sites = await api(`/campgrounds/${t.campground_id}/sites?month=${month.slice(0, 7)}-01&provider=${providerOf(t)}`);
       state.siteCache.set(cacheKey, sites);
     }
   } catch (err) {
