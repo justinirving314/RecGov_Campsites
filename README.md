@@ -106,7 +106,6 @@ Watching works the same as for Recreation.gov, with these differences:
 
 - The **Book** link opens the campground's page on ReserveCalifornia, not the exact site, because ReserveCalifornia has no per-site link. The alert tells you which site number to pick.
 - **No cart holds.** ReserveCalifornia openings always alert only, even on a watch set to "hold in cart". Some of its campgrounds use CAPTCHAs, and holding would need a separate, site-specific automation.
-- **Minimum stays are respected.** Many parks require 2 nights on summer weekends. A single open night that can't be booked alone doesn't trigger an alert.
 - Campground search uses ReserveCalifornia's list of every park and facility, which CampWatch downloads once a day.
 
 ReserveCalifornia is run for California State Parks by Tyler Technologies. Its terms apply to automated access just as Recreation.gov's do.

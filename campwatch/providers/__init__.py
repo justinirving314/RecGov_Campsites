@@ -36,8 +36,6 @@ class Campsite:
     type_of_use: str = ""
     # Night (check-in date) -> status string; only "Available" is bookable.
     availability: dict[date, str] = field(default_factory=dict)
-    # Night -> minimum nights for a stay starting that night, where the system reports it.
-    min_stay: dict[date, int] = field(default_factory=dict)
 
 
 class Provider(Protocol):

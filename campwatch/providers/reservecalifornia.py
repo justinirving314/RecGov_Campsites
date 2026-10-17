@@ -10,7 +10,7 @@ import asyncio
 import re
 import time
 from collections.abc import Callable
-from datetime import date
+from datetime import date, timedelta
 
 import httpx
 
@@ -26,6 +26,7 @@ from . import (
 API_URL = "https://california-rdr.prod.cali.rd12.recreation-management.tylerapp.com"
 SITE_URL = "https://www.reservecalifornia.com"
 METADATA_TTL_SECONDS = 24 * 3600
+MAX_GRID_REQUESTS = 4  # per month, if the server returns fewer nights than asked for
 
 HEADERS = {
     "Accept": "application/json",
@@ -62,39 +63,26 @@ def parse_grid(payload: dict, month: date) -> list[Campsite]:
         message = payload.get("Message") if isinstance(payload, dict) else None
         raise ProviderError(message or "availability response has no 'Facility'")
 
+    # The request already asks for web-bookable units only (WebOnly), so every unit counts.
     sites = []
     for unit_id, unit in (facility.get("Units") or {}).items():
-        if unit.get("IsWebViewable") is False or unit.get("AllowWebBooking") is False:
-            continue  # can't be booked online
         availability: dict[date, str] = {}
-        min_stay: dict[date, int] = {}
         for key, slot in (unit.get("Slices") or {}).items():
             night = date.fromisoformat(str(slot.get("Date") or key)[:10])
             if (night.year, night.month) != (month.year, month.month):
                 continue
-            availability[night] = _status(slot)
-            if slot.get("MinStay"):
-                min_stay[night] = int(slot["MinStay"])
+            # IsFree alone decides, as in camply's long-running ReserveCalifornia support.
+            # The slot's MinStay field is ignored: it flagged stays the website allows.
+            availability[night] = AVAILABLE if slot.get("IsFree") else "Reserved"
         name = str(unit.get("ShortName") or unit.get("Name") or unit_id)
         sites.append(
             Campsite(
                 campsite_id=str(unit.get("UnitId") or unit_id),
                 site=_SITE_PREFIX.sub("", name).strip() or name,
                 availability=availability,
-                min_stay=min_stay,
             )
         )
     return sites
-
-
-def _status(slot: dict) -> str:
-    if slot.get("IsReservationDraw"):
-        return "Lottery"
-    if slot.get("IsWalkin"):
-        return "Walk-up"
-    if slot.get("IsBlocked"):
-        return "Not Available"
-    return AVAILABLE if slot.get("IsFree") else "Reserved"
 
 
 class ReserveCaliforniaClient:
@@ -129,25 +117,41 @@ class ReserveCaliforniaClient:
         except ValueError as exc:
             raise ProviderError(f"{path} did not return JSON") from exc
 
-    async def month_availability(self, campground_id: str, month: date) -> list[Campsite]:
-        first = month.replace(day=1)
-        next_month = date(first.year + first.month // 12, first.month % 12 + 1, 1)
-        start = max(first, self._today())  # the grid rejects dates in the past
-        if start >= next_month:
-            return []
-        payload = await self._request(
+    async def grid(self, campground_id: str, start: date, end: date) -> dict:
+        """The raw availability grid for nights from ``start`` up to ``end``."""
+        return await self._request(
             "POST",
             "/rdr/search/grid",
             json={
                 "FacilityId": int(campground_id),
                 "StartDate": start.strftime("%m-%d-%Y"),
-                "EndDate": next_month.strftime("%m-%d-%Y"),
+                "EndDate": end.strftime("%m-%d-%Y"),
                 "WebOnly": True,
                 "InSeasonOnly": True,
                 "UnitSort": "orderby",
             },
         )
-        return parse_grid(payload, first)
+
+    async def month_availability(self, campground_id: str, month: date) -> list[Campsite]:
+        first = month.replace(day=1)
+        next_month = date(first.year + first.month // 12, first.month % 12 + 1, 1)
+        start = max(first, self._today())  # the grid rejects dates in the past
+        merged: dict[str, Campsite] = {}
+        for _ in range(MAX_GRID_REQUESTS):
+            if start >= next_month:
+                break
+            chunk = parse_grid(await self.grid(campground_id, start, next_month), first)
+            for site in chunk:
+                if site.campsite_id in merged:
+                    merged[site.campsite_id].availability.update(site.availability)
+                else:
+                    merged[site.campsite_id] = site
+            # If the server stopped short of the month's end, ask for the rest.
+            last = max((n for site in chunk for n in site.availability), default=None)
+            if last is None or last < start:
+                break
+            start = last + timedelta(days=1)
+        return list(merged.values())
 
     async def _metadata(self) -> tuple[dict[str, dict], dict[str, dict]]:
         """Every park ("place") and facility, cached for a day. Search runs on this list."""

@@ -110,25 +110,6 @@ def test_normalize_site():
     assert normalize_site("b12") == "B12"
 
 
-def test_minimum_stay_rules_are_respected():
-    s = Campsite(
-        campsite_id="1",
-        site="001",
-        availability={d(10): "Available", d(11): "Available", d(14): "Available"},
-        min_stay={d(10): 2, d(14): 2},
-    )
-    stays = find_stays([s], d(1), d(20), min_nights=1)
-    # Jul 10-12 meets the 2-night minimum; a lone Jul 14 night doesn't.
-    assert [(x.check_in, x.check_out) for x in stays] == [(d(10), d(12))]
-
-
-def test_merge_months_keeps_minimum_stays():
-    a = Campsite(campsite_id="1", site="1", availability={d(31): "Available"}, min_stay={d(31): 2})
-    b = Campsite(campsite_id="1", site="1", availability={d(1, 8): "Available"})
-    [merged] = merge_months([[a], [b]])
-    assert merged.min_stay == {d(31): 2}
-
-
 @pytest.mark.parametrize(
     ("entries", "name", "expected"),
     [

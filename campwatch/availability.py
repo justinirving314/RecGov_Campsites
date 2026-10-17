@@ -42,7 +42,6 @@ def merge_months(months: Iterable[list[Campsite]]) -> list[Campsite]:
         for site in month:
             if site.campsite_id in merged:
                 merged[site.campsite_id].availability.update(site.availability)
-                merged[site.campsite_id].min_stay.update(site.min_stay)
             else:
                 merged[site.campsite_id] = Campsite(
                     campsite_id=site.campsite_id,
@@ -51,7 +50,6 @@ def merge_months(months: Iterable[list[Campsite]]) -> list[Campsite]:
                     campsite_type=site.campsite_type,
                     type_of_use=site.type_of_use,
                     availability=dict(site.availability),
-                    min_stay=dict(site.min_stay),
                 )
     return list(merged.values())
 
@@ -122,7 +120,6 @@ def find_stays(
     accepts any run of at least that many consecutive nights, reported as its longest run.
     ``sites`` limits the search to those sites and ranges (see ``site_matcher``); empty
     means any site.
-    A run shorter than the site's minimum stay for its first night is skipped.
     ``needed``, if given, is the set of nights still wanted; other nights break a run.
     """
     window = nights_between(check_in, check_out)
@@ -146,7 +143,7 @@ def find_stays(
             ):
                 run.append(night)
                 continue
-            if run and len(run) >= max(shortest, site.min_stay.get(run[0], 1)):
+            if run and len(run) >= shortest:
                 stays.append(
                     Stay(
                         campsite_id=site.campsite_id,

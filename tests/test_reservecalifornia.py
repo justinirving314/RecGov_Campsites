@@ -5,6 +5,7 @@ from datetime import date
 import httpx
 import pytest
 
+from campwatch.availability import find_stays
 from campwatch.providers import ProviderError, RateLimitedError
 from campwatch.providers.reservecalifornia import (
     ReserveCaliforniaClient,
@@ -51,41 +52,40 @@ class FakeTyler:
         return [r.url.path for r in self.requests]
 
 
-def test_parse_grid_statuses_and_names():
+def test_parse_grid_uses_is_free_and_names():
     payload = grid_payload(
         d(1),
         d(1, 8),
-        {"1": ("Site 012", {d(4), d(5), d(6), d(7)}), "2": ("Campsite #3", set())},
-        **{
-            "1": {
-                "slices": {
-                    d(5): {"IsWalkin": True},
-                    d(6): {"IsBlocked": True},
-                    d(7): {"IsReservationDraw": True},
-                    d(4): {"MinStay": 2},
-                }
-            }
-        },
+        {"1": ("Site 012", {d(4), d(5)}), "2": ("Campsite #3", set())},
+        # Other flags don't override IsFree, matching camply's long-running behaviour.
+        **{"1": {"slices": {d(5): {"IsWalkin": True, "IsBlocked": True}}}},
     )
     sites = {s.campsite_id: s for s in parse_grid(payload, JULY)}
     assert (sites["1"].site, sites["2"].site) == ("012", "3")
     a = sites["1"].availability
-    assert (a[d(4)], a[d(5)], a[d(6)], a[d(7)], a[d(8)]) == (
-        "Available",
-        "Walk-up",
-        "Not Available",
-        "Lottery",
-        "Reserved",
-    )
+    assert (a[d(4)], a[d(5)], a[d(6)]) == ("Available", "Available", "Reserved")
     assert d(1, 8) not in a, "nights outside the month are dropped"
-    assert sites["1"].min_stay[d(4)] == 2
 
 
-def test_parse_grid_skips_units_not_bookable_online():
+def test_min_stay_field_does_not_hide_a_single_open_night():
+    # Regression: a lone open Saturday (Jul 24, 2027) with MinStay 2 in the grid was hidden,
+    # though the website lets you book it.
     payload = grid_payload(
-        d(1), d(2), {"1": ("1", {d(1)}), "2": ("2", {d(1)})}, **{"2": {"AllowWebBooking": False}}
+        d(1), d(1, 8), {"1": ("024", {d(24)})}, **{"1": {"slices": {d(24): {"MinStay": 2}}}}
     )
-    assert [s.campsite_id for s in parse_grid(payload, JULY)] == ["1"]
+    stays = find_stays(parse_grid(payload, JULY), d(24), d(25))
+    assert [(s.site, s.check_in, s.check_out) for s in stays] == [("024", d(24), d(25))]
+
+
+def test_parse_grid_keeps_units_regardless_of_unit_flags():
+    # The request already asks for web-bookable units; don't second-guess unit flags.
+    payload = grid_payload(
+        d(1),
+        d(2),
+        {"1": ("1", {d(1)}), "2": ("2", {d(1)})},
+        **{"2": {"AllowWebBooking": False, "IsWebViewable": False}},
+    )
+    assert sorted(s.campsite_id for s in parse_grid(payload, JULY)) == ["1", "2"]
 
 
 def test_parse_grid_reports_api_message():
@@ -102,6 +102,28 @@ def test_month_availability_request():
     body = json.loads(request.content)
     assert body["FacilityId"] == 766
     assert (body["StartDate"], body["EndDate"]) == ("07-01-2027", "08-01-2027")
+
+
+def test_month_availability_fetches_the_rest_when_the_server_stops_short():
+    requests = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        requests.append((body["StartDate"], body["EndDate"]))
+        month, day, year = map(int, body["StartDate"].split("-"))
+        start = date(year, month, day)
+        end = min(start.fromordinal(start.toordinal() + 9), d(31))  # only 10 nights at a time
+        return httpx.Response(200, json=grid_payload(start, end, {"1": ("1", {d(24)})}))
+
+    [site] = run(client_for(handler).month_availability("615", JULY))
+    assert requests == [
+        ("07-01-2027", "08-01-2027"),
+        ("07-11-2027", "08-01-2027"),
+        ("07-21-2027", "08-01-2027"),
+        ("07-31-2027", "08-01-2027"),
+    ]
+    assert len(site.availability) == 31
+    assert site.availability[d(24)] == "Available"
 
 
 def test_month_availability_starts_today_and_rolls_over_year():
