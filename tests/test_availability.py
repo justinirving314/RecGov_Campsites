@@ -1,6 +1,15 @@
 from datetime import date
 
-from campwatch.availability import find_stays, merge_months, months_for, normalize_site
+import pytest
+
+from campwatch.availability import (
+    find_stays,
+    merge_months,
+    months_for,
+    normalize_site,
+    parse_site_range,
+    site_matcher,
+)
 from campwatch.providers import Campsite
 
 
@@ -118,3 +127,46 @@ def test_merge_months_keeps_minimum_stays():
     b = Campsite(campsite_id="1", site="1", availability={d(1, 8): "Available"})
     [merged] = merge_months([[a], [b]])
     assert merged.min_stay == {d(31): 2}
+
+
+@pytest.mark.parametrize(
+    ("entries", "name", "expected"),
+    [
+        (["10-12"], "010", True),
+        (["10-12"], "11", True),
+        (["10-12"], "12A", True),  # a lettered variant of site 12
+        (["10-12"], "13", False),
+        (["10-12"], "A11", False),  # different prefix
+        (["A1-A10"], "a05", True),
+        (["A1-10"], "A10", True),  # prefix may be left off the end
+        (["A1-A10"], "B5", False),
+        (["A1-A10"], "5", False),
+        (["B-7"], "B-7", True),  # a site literally named "B-7", not a range
+        (["B-7"], "B6", False),
+        (["3", "20 - 22"], "021", True),
+        (["3", "20 - 22"], "003", True),
+        (["Walk-in 4"], "WALK-IN 4", True),
+        (["15-12"], "13", True),  # backwards is rejected by the API but still matches here
+    ],
+)
+def test_site_matcher(entries, name, expected):
+    assert site_matcher(entries)(name) is expected
+
+
+def test_no_entries_means_any_site():
+    assert site_matcher([]) is None
+    assert site_matcher([" "]) is None
+
+
+@pytest.mark.parametrize(
+    ("entry", "expected"),
+    [("10-25", ("", 10, 25)), ("a1 - a10", ("A", 1, 10)), ("A1-B10", None), ("A-12", None)],
+)
+def test_parse_site_range(entry, expected):
+    assert parse_site_range(entry) == expected
+
+
+def test_find_stays_with_ranges():
+    sites = [site(str(i), f"{i:03d}", [d(10)]) for i in range(1, 30)]
+    stays = find_stays(sites, d(10), d(11), sites=["5", "20-22"])
+    assert sorted(s.site for s in stays) == ["005", "020", "021", "022"]

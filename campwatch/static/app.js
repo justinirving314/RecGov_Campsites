@@ -126,6 +126,9 @@ function providerBadge(t) {
 function campgroundLabel(t) {
   const base = t.campground_name || `Campground ${t.campground_id}`;
   const name = providerOf(t) === 'recgov' ? base : `${base} (${PROVIDERS[providerOf(t)]})`;
+  if (!t.sites.length) return name;
+  const list = t.sites.join(', ');
+  return `${name}, sites ${list.length > 30 ? `${list.slice(0, 29)}…` : list}`;
   return t.sites.length ? `${name} (${t.sites.length} site${t.sites.length === 1 ? '' : 's'})` : name;
 }
 
@@ -329,27 +332,39 @@ async function renderEditor(id) {
   }
 
   function targetItem(t, onRemove) {
-    const summary = h('button', { class: 'btn small', type: 'button' });
-    const picker = h('div', { class: 'site-picker', hidden: true });
-    const updateSummary = () => {
-      summary.textContent = t.sites.length
-        ? `Only site${t.sites.length === 1 ? '' : 's'} ${t.sites.slice(0, 6).join(', ')}${t.sites.length > 6 ? '…' : ''} ▾`
-        : 'Any site ▾';
+    t.mode = t.mode || (t.sites.length ? 'some' : 'any');
+    let stash = [];
+    const anyBtn = h('button', { class: 'seg', type: 'button' }, 'Any site');
+    const someBtn = h('button', { class: 'seg', type: 'button' }, 'Specific sites');
+    const panel = h('div', { class: 'site-picker' });
+    const setMode = (mode) => {
+      t.mode = mode;
+      anyBtn.setAttribute('aria-pressed', String(mode === 'any'));
+      someBtn.setAttribute('aria-pressed', String(mode === 'some'));
+      panel.hidden = mode === 'any';
+      if (mode === 'some' && !panel.childElementCount) buildSitePicker(t, panel, draft);
     };
-    updateSummary();
-    summary.addEventListener('click', async () => {
-      if (!picker.hidden) { picker.hidden = true; return; }
-      picker.hidden = false;
-      if (!picker.childElementCount) await fillPicker(t, picker, updateSummary, draft);
+    anyBtn.addEventListener('click', () => {
+      if (t.sites.length) stash = t.sites; // so switching back restores what was typed
+      t.sites = [];
+      panel.replaceChildren();
+      setMode('any');
     });
+    someBtn.addEventListener('click', () => {
+      if (t.mode === 'some') return;
+      if (!t.sites.length) t.sites = stash;
+      setMode('some');
+      panel.querySelector('input')?.focus();
+    });
+    setMode(t.mode);
     return h('div', { class: 'target' },
       h('div', { class: 'target-head' },
         h('div', {},
           h('div', { class: 'result-title' }, h('strong', {}, t.campground_name || `Campground ${t.campground_id}`), providerBadge(t)),
           h('div', { class: 'small muted' }, t.location || `ID ${t.campground_id}`)),
         h('button', { class: 'icon-btn', type: 'button', 'aria-label': 'Remove campground', onclick: onRemove }, '×')),
-      h('div', {}, summary),
-      picker);
+      h('div', { class: 'segmented', role: 'group', 'aria-label': 'Which sites' }, anyBtn, someBtn),
+      panel);
   }
 
   // Dates
@@ -410,6 +425,14 @@ async function renderEditor(id) {
       e.preventDefault();
       const ranges = draft.date_ranges.filter((r) => r.check_in || r.check_out);
       if (!draft.targets.length) return toast('Add at least one campground.', 'error');
+      for (const t of draft.targets) {
+        const label = t.campground_name || `campground ${t.campground_id}`;
+        if (t.mode === 'some' && !t.sites.length) {
+          return toast(`Enter sites for ${label}, or choose “Any site”.`, 'error');
+        }
+        const backwards = backwardsRanges(t.sites);
+        if (backwards.length) return toast(`Site range ${backwards[0]} is backwards (${label}).`, 'error');
+      }
       if (!ranges.length) return toast('Add at least one set of dates.', 'error');
       if (ranges.some((r) => !r.check_in || !r.check_out || r.check_out <= r.check_in)) {
         return toast('Each check-out date must be after its check-in date.', 'error');
@@ -422,7 +445,7 @@ async function renderEditor(id) {
           campground_name: t.campground_name,
           location: t.location || '',
           park_id: t.park_id || '',
-          sites: t.sites,
+          sites: t.mode === 'some' ? t.sites : [],
         })),
         date_ranges: ranges.map(({ check_in, check_out }) => ({ check_in, check_out })),
         min_nights: flexStay.checked ? Number(minNights.value) || 1 : null,
@@ -443,7 +466,7 @@ async function renderEditor(id) {
     targetsBox,
     search,
     results,
-    h('p', { class: 'hint' }, 'Searches Recreation.gov and ReserveCalifornia (CA State Parks). Add as many as you like; any of them will do. To watch only certain sites, tap “Any site”.')),
+    h('p', { class: 'hint' }, 'Searches Recreation.gov and ReserveCalifornia (CA State Parks). Add as many as you like; any of them will do.')),
   h('fieldset', {},
     h('legend', {}, 'Dates'),
     datesBox,
@@ -489,60 +512,138 @@ async function renderEditor(id) {
   drawDates();
 }
 
-async function fillPicker(t, picker, onChange, draft) {
-  picker.replaceChildren(h('div', { class: 'muted small' }, 'Loading sites…'));
-  const firstDate = draft.date_ranges.map((r) => r.check_in).filter(Boolean).sort()[0];
-  const month = firstDate || isoDay(new Date());
-  const cacheKey = `${providerOf(t)}:${t.campground_id}:${month.slice(0, 7)}`;
-  let sites = state.siteCache.get(cacheKey);
-  try {
-    if (!sites) {
-      sites = await api(`/campgrounds/${t.campground_id}/sites?month=${month.slice(0, 7)}-01&provider=${providerOf(t)}`);
-      state.siteCache.set(cacheKey, sites);
-    }
-  } catch (err) {
-    picker.replaceChildren(h('div', { class: 'error-text' }, `Couldn't load sites: ${err.message}`));
-    return;
-  }
+// Site entries are names ("12", "A5") or ranges ("10-25", "A1-A10"). This mirrors
+// site_matcher in campwatch/availability.py, which does the real matching on the server.
+const compactSite = (s) => s.toUpperCase().replace(/\s+/g, '');
+const normalizeSite = (s) => compactSite(s).replace(/\d+/g, (d) => String(Number(d)));
 
-  const chosen = new Set(t.sites);
-  const chips = h('div', { class: 'chips' });
-  const filter = h('input', { type: 'search', placeholder: 'Filter sites or loops', autocomplete: 'off', 'aria-label': 'Filter sites' });
-  const sync = () => { t.sites = [...chosen]; onChange(); };
+function parseSiteRange(entry) {
+  const m = compactSite(entry).match(/^([A-Z]*)(\d+)-([A-Z]*)(\d+)$/);
+  if (!m || (m[3] && m[3] !== m[1])) return null;
+  return { prefix: m[1], start: Number(m[2]), end: Number(m[4]) };
+}
 
-  const draw = () => {
-    const q = filter.value.trim().toLowerCase();
-    const items = [];
-    let loop = null;
-    for (const s of sites) {
-      if (q && !s.site.toLowerCase().includes(q) && !s.loop.toLowerCase().includes(q)) continue;
-      if (s.loop !== loop) {
-        loop = s.loop;
-        if (loop) items.push(h('div', { class: 'chip-group' }, loop));
-      }
-      const chip = h('button', { class: `chip${chosen.has(s.site) ? ' on' : ''}`, type: 'button', 'aria-pressed': String(chosen.has(s.site)), title: s.campsite_type }, s.site);
-      chip.addEventListener('click', () => {
-        if (chosen.has(s.site)) chosen.delete(s.site); else chosen.add(s.site);
-        chip.classList.toggle('on', chosen.has(s.site));
-        chip.setAttribute('aria-pressed', String(chosen.has(s.site)));
-        sync();
-      });
-      items.push(chip);
-    }
-    chips.replaceChildren(...(items.length ? items : [h('div', { class: 'muted small' }, 'No matching sites')]));
+function siteMatcher(entries) {
+  if (!entries.length) return null;
+  const exact = new Set(entries.map(normalizeSite));
+  const ranges = entries.map(parseSiteRange).filter(Boolean);
+  return (name) => {
+    if (exact.has(normalizeSite(name))) return true;
+    const m = compactSite(name).match(/^([A-Z]*)(\d+)[A-Z]*$/);
+    if (!m) return false;
+    const n = Number(m[2]);
+    return ranges.some((r) => r.prefix === m[1] && n >= Math.min(r.start, r.end) && n <= Math.max(r.start, r.end));
   };
-  filter.addEventListener('input', draw);
-  draw();
+}
 
-  picker.replaceChildren(
-    h('p', { class: 'hint' }, `${sites.length} sites. Tap to pick the ones you want, or leave all off for any site.`),
-    filter,
-    chips,
-    h('div', {}, h('button', {
-      class: 'btn small ghost',
-      type: 'button',
-      onclick: () => { chosen.clear(); sync(); draw(); },
-    }, 'Clear (any site)')));
+function parseSiteText(text) {
+  return [...new Set(text.split(/[,;\n]+/).map((e) => e.trim().replace(/\s*-\s*/g, '-')).filter(Boolean))];
+}
+
+function backwardsRanges(entries) {
+  return entries.filter((e) => {
+    const r = parseSiteRange(e);
+    return r && r.start > r.end;
+  });
+}
+
+async function loadSites(t, draft) {
+  const firstDate = draft.date_ranges.map((r) => r.check_in).filter(Boolean).sort()[0];
+  const month = (firstDate || isoDay(new Date())).slice(0, 7);
+  const cacheKey = `${providerOf(t)}:${t.campground_id}:${month}`;
+  if (!state.siteCache.has(cacheKey)) {
+    const sites = await api(`/campgrounds/${t.campground_id}/sites?month=${month}-01&provider=${providerOf(t)}`);
+    state.siteCache.set(cacheKey, sites);
+  }
+  return state.siteCache.get(cacheKey);
+}
+
+function buildSitePicker(t, panel, draft) {
+  const input = h('input', {
+    type: 'text',
+    value: t.sites.join(', '),
+    placeholder: 'e.g. 12, 15-22, A1-A10',
+    autocomplete: 'off',
+    autocapitalize: 'characters',
+    spellcheck: 'false',
+  });
+  const status = h('p', { class: 'hint' });
+  const chipsBox = h('div', { class: 'site-list' }, h('div', { class: 'muted small' }, 'Loading the site list…'));
+  let sites = null;
+  let loadError = null;
+  let redrawChips = () => {};
+
+  const refresh = () => {
+    const backwards = backwardsRanges(t.sites);
+    status.classList.toggle('error-text', backwards.length > 0);
+    if (backwards.length) {
+      status.textContent = `${backwards.join(', ')}: write ranges low to high, like 12-20.`;
+    } else if (!t.sites.length) {
+      status.textContent = 'Type site numbers or ranges, separated by commas, or tap sites below.';
+    } else if (sites) {
+      const matches = siteMatcher(t.sites);
+      const count = sites.filter((s) => matches(s.site)).length;
+      const unmatched = t.sites.filter((e) => !sites.some((s) => siteMatcher([e])(s.site)));
+      status.textContent = `Watching ${count} of ${sites.length} sites.`
+        + (unmatched.length ? ` Nothing matches ${unmatched.join(', ')}.` : '');
+    } else {
+      status.textContent = loadError ? 'Couldn’t check these against the site list.' : '';
+    }
+    redrawChips();
+  };
+
+  input.addEventListener('input', () => { t.sites = parseSiteText(input.value); refresh(); });
+  input.addEventListener('blur', () => { input.value = t.sites.join(', '); });
+
+  panel.replaceChildren(h('label', {}, 'Sites or ranges', input), status, chipsBox);
+  refresh();
+
+  loadSites(t, draft).then((list) => {
+    sites = list;
+    const filter = h('input', { type: 'search', placeholder: 'Filter sites or loops', autocomplete: 'off', 'aria-label': 'Filter sites' });
+    const chips = h('div', { class: 'chips' });
+    redrawChips = () => {
+      const matches = siteMatcher(t.sites);
+      const q = filter.value.trim().toLowerCase();
+      const items = [];
+      let loop = null;
+      for (const s of sites) {
+        if (q && !s.site.toLowerCase().includes(q) && !s.loop.toLowerCase().includes(q)) continue;
+        if (s.loop !== loop) {
+          loop = s.loop;
+          if (loop) items.push(h('div', { class: 'chip-group' }, loop));
+        }
+        const on = !!matches && matches(s.site);
+        items.push(h('button', {
+          class: `chip${on ? ' on' : ''}`,
+          type: 'button',
+          'aria-pressed': String(on),
+          title: s.campsite_type,
+          onclick: () => {
+            const exact = t.sites.findIndex((e) => normalizeSite(e) === normalizeSite(s.site));
+            if (exact >= 0) {
+              t.sites = t.sites.filter((_, i) => i !== exact);
+            } else if (on) {
+              toast(`Site ${s.site} is part of a range. Edit the range to leave it out.`);
+              return;
+            } else {
+              t.sites = [...t.sites, s.site];
+            }
+            input.value = t.sites.join(', ');
+            refresh();
+          },
+        }, s.site));
+      }
+      chips.replaceChildren(...(items.length ? items : [h('div', { class: 'muted small' }, 'No matching sites')]));
+    };
+    filter.addEventListener('input', redrawChips);
+    chipsBox.replaceChildren(h('p', { class: 'hint' }, 'Or tap sites to add or remove them:'), filter, chips);
+    refresh();
+  }).catch((err) => {
+    loadError = err;
+    chipsBox.replaceChildren(h('div', { class: 'muted small' }, `Couldn’t load the site list (${err.message}). You can still type sites.`));
+    refresh();
+  });
 }
 
 // ---------- Activity ----------

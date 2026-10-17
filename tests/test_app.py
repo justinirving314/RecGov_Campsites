@@ -284,3 +284,26 @@ def test_forged_cookie_rejected(tmp_path):
     with make_client(tmp_path, app_password="pw") as c:
         c.cookies.set("campwatch_session", "99999999999.deadbeef")
         assert c.get("/api/watches").status_code == 401
+
+
+def test_site_entries_are_tidied_and_ranges_checked(client):
+    target = {**WATCH["targets"][0], "sites": [" 12 ", "15 - 22", "A1-A10", "12", ""]}
+    watch = client.post("/api/watches", json={**WATCH, "targets": [target]}).json()
+    assert watch["targets"][0]["sites"] == ["12", "15-22", "A1-A10"]
+
+    backwards = {**WATCH["targets"][0], "sites": ["22-15"]}
+    resp = client.post("/api/watches", json={**WATCH, "targets": [backwards]})
+    assert resp.status_code == 422
+    assert "backwards" in resp.text
+
+
+def test_site_range_limits_what_alerts(client):
+    # FakeInternet has site "10" open; a range that excludes it finds nothing.
+    excluded = {**WATCH["targets"][0], "sites": ["1-9", "11-20"]}
+    watch = client.post("/api/watches", json={**WATCH, "targets": [excluded]}).json()
+    assert client.post(f"/api/watches/{watch['id']}/check").json()["openings"] == []
+
+    included = {**WATCH["targets"][0], "sites": ["5-15"]}
+    watch = client.post("/api/watches", json={**WATCH, "targets": [included]}).json()
+    [opening] = client.post(f"/api/watches/{watch['id']}/check").json()["openings"]
+    assert opening["site"] == "10"

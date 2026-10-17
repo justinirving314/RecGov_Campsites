@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+import re
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import date, timedelta
 
@@ -55,9 +56,56 @@ def merge_months(months: Iterable[list[Campsite]]) -> list[Campsite]:
     return list(merged.values())
 
 
+_SITE_RANGE = re.compile(r"^([A-Z]*)(\d+)-([A-Z]*)(\d+)$")
+_SITE_NUMBER = re.compile(r"^([A-Z]*)(\d+)[A-Z]*$")
+
+
+def _compact(name: str) -> str:
+    return re.sub(r"\s+", "", name.upper())
+
+
 def normalize_site(name: str) -> str:
-    """Treat "012", "12" and " 12 " as the same site."""
-    return name.strip().upper().lstrip("0") or "0"
+    """Treat "012", "12" and " 12 " (and "A05" and "a5") as the same site."""
+    return re.sub(r"\d+", lambda m: str(int(m.group())), _compact(name))
+
+
+def parse_site_range(entry: str) -> tuple[str, int, int] | None:
+    """("A", 1, 10) for "A1-A10" or "a1 - 10"; None if the entry isn't a range.
+
+    Both ends must share a letter prefix, so a site literally named "A-12" isn't a range.
+    """
+    match = _SITE_RANGE.match(_compact(entry))
+    if not match:
+        return None
+    prefix, start, end_prefix, end = match.groups()
+    if end_prefix and end_prefix != prefix:
+        return None
+    return prefix, int(start), int(end)
+
+
+def site_matcher(entries: Iterable[str]) -> Callable[[str], bool] | None:
+    """A test for site names from entries like "12", "A5", "10-25" or "A1-A10".
+
+    Returns None when there are no entries, meaning any site will do. A site matches if
+    its name equals an entry, or its letter prefix matches a range and its number is in it
+    ("12A" counts as 12).
+    """
+    entries = [e for e in entries if e.strip()]
+    if not entries:
+        return None
+    exact = {normalize_site(e) for e in entries}
+    ranges = [r for e in entries if (r := parse_site_range(e))]
+
+    def matches(name: str) -> bool:
+        if normalize_site(name) in exact:
+            return True
+        number = _SITE_NUMBER.match(_compact(name))
+        if not number:
+            return False
+        prefix, value = number.group(1), int(number.group(2))
+        return any(prefix == p and min(lo, hi) <= value <= max(lo, hi) for p, lo, hi in ranges)
+
+    return matches
 
 
 def find_stays(
@@ -71,18 +119,19 @@ def find_stays(
 
     ``min_nights=None`` means the whole range must be open at a single site. A smaller value
     accepts any run of at least that many consecutive nights, reported as its longest run.
-    ``sites`` limits the search to those site names; empty means any site.
+    ``sites`` limits the search to those sites and ranges (see ``site_matcher``); empty
+    means any site.
     A run shorter than the site's minimum stay for its first night is skipped.
     """
     window = nights_between(check_in, check_out)
     if not window:
         return []
     needed = len(window) if min_nights is None else min(min_nights, len(window))
-    wanted = {normalize_site(s) for s in sites}
+    wanted = site_matcher(sites)
 
     stays = []
     for site in campsites:
-        if wanted and normalize_site(site.site) not in wanted:
+        if wanted and not wanted(site.site):
             continue
         if site.type_of_use.lower() == "day":
             continue

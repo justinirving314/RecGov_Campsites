@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, date, datetime, timedelta
 from typing import Annotated, Literal
 
 from pydantic import AfterValidator, BaseModel, Field, field_validator, model_validator
+
+from .availability import parse_site_range
 
 MAX_RANGE_DAYS = 180
 
@@ -27,12 +30,22 @@ class Target(BaseModel):
     campground_name: str = Field("", max_length=200)
     location: str = Field("", max_length=200)
     park_id: str = Field("", pattern=r"^\d{0,12}$")
+    # Site names and ranges, e.g. ["12", "15-22", "A1-A10"]. Empty means any site.
     sites: list[str] = Field(default_factory=list, max_length=300)
 
     @field_validator("sites")
     @classmethod
     def _clean_sites(cls, sites: list[str]) -> list[str]:
-        return list(dict.fromkeys(s.strip()[:50] for s in sites if s.strip()))
+        cleaned = []
+        for entry in sites:
+            entry = re.sub(r"\s*-\s*", "-", entry.strip())[:50]
+            if not entry:
+                continue
+            site_range = parse_site_range(entry)
+            if site_range and site_range[1] > site_range[2]:
+                raise ValueError(f"site range {entry} is backwards")
+            cleaned.append(entry)
+        return list(dict.fromkeys(cleaned))
 
 
 class DateRange(BaseModel):

@@ -3,6 +3,7 @@
 Watch campgrounds on **Recreation.gov** (national parks and forests, Army Corps lakes and more) and **ReserveCalifornia** (California State Parks) for cancellations, and get an alert on your phone the moment a site opens up. For Recreation.gov sites, you can also have it put the site in your cart so it's held while you pay.
 
 - **Watches.** Each watch covers one or more campgrounds (optionally only certain sites) and one or more sets of dates. A single watch can mix Recreation.gov and California State Parks campgrounds. Add as many watches as you like.
+- **Any site or specific sites.** For each campground, choose **Any site** or **Specific sites**. Type sites and ranges such as `12, 15-22, A1-A10`, or tap sites on the campground's list. The app shows how many sites your entries cover and flags any that match nothing.
 - **Stay rules.** Ask for the whole stay at one site, or for any N nights in a row within a wider window, such as "any 2 nights in July".
 - **Alerts.** Push notifications through [ntfy](https://ntfy.sh) or [Pushover](https://pushover.net), or email. Each alert has a "Book" link that opens the site's page. You're alerted once per opening, not every minute.
 - **Hold in cart (optional, experimental, Recreation.gov only).** CampWatch signs in to your Recreation.gov account and adds the site to your cart. You then have about 15 minutes to pay. Payment is always left to you.
@@ -65,6 +66,19 @@ Configure any combination in `.env`:
 | ntfy (recommended) | `CAMPWATCH_NTFY_TOPIC` | Free iPhone app, no account needed. Anyone who knows the topic can read it, so use a long random name (e.g. `campwatch-7f3k9q2x`). You can self-host ntfy and set `CAMPWATCH_NTFY_SERVER` / `CAMPWATCH_NTFY_TOKEN`. |
 | Pushover | `CAMPWATCH_PUSHOVER_USER_KEY`, `CAMPWATCH_PUSHOVER_APP_TOKEN` | One-time purchase, very reliable. |
 | Email | `CAMPWATCH_SMTP_*`, `CAMPWATCH_EMAIL_TO` | For Gmail: `smtp.gmail.com`, port 465, and a [Google app password](https://myaccount.google.com/apppasswords). |
+
+## Choosing sites
+
+Each campground in a watch is set to **Any site** (the default) or **Specific sites**. With specific sites, type entries separated by commas:
+
+| Entry | Matches |
+| --- | --- |
+| `12` | Site 12, also written `012` |
+| `15-22` | Sites 15 through 22, including lettered variants like `18A` |
+| `A1-A10` (or `A1-10`) | Sites A1 through A10, not B5 or plain 5 |
+| `B-7` | A site literally named `B-7`. Both ends of a range need numbers, so this isn't one |
+
+You can also tap sites in the list below the box to add or remove them; the box and the list stay in sync. Sites covered by a range can only be removed by editing the range. Switching to **Any site** and back restores what you typed.
 
 ## California State Parks
 
